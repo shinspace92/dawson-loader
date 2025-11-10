@@ -1,9 +1,16 @@
 CC_x64 := x86_64-w64-mingw32-gcc
-CFLAGS	:= $(CFLAGS) -O0 
+CFLAGS	:= $(CFLAGS) -O0
 CFLAGS  := $(CFLAGS) -masm=intel -Wall -Wno-pointer-arith -w
 
-bokuloader: clean
-	$(CC_x64) $(CFLAGS) -c src/BokuLoader.c -o dist/BokuLoader.x64.o 
+dawsonloader: clean dist/DawsonLoader.o dist/jopcall_integration.o
+	x86_64-w64-mingw32-ld -r dist/DawsonLoader.o dist/jopcall_integration.o -o dist/DawsonLoader.x64.o
+
+dist/DawsonLoader.o: src/DawsonLoader.c
+	$(CC_x64) $(CFLAGS) -c src/DawsonLoader.c -o dist/DawsonLoader.o
+
+dist/jopcall_integration.o: src/jopcall_integration.c
+	$(CC_x64) $(CFLAGS) -c src/jopcall_integration.c -o dist/jopcall_integration.o
+
 clean:
 	rm -f dist/*.o
 	rm -f ./*.c
