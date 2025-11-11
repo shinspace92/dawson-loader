@@ -1,0 +1,476 @@
+# ----------------------------------------------
+# Globals
+# ----------------------------------------------
+global('$global_init $global_running_single $global_jid');
+$global_init = 0;
+$global_running_single = 0;
+$global_jid = 0;
+
+# ----------------------------------------------
+# Retrieve the content of the user provided file.
+#
+# @param path - the path to the file.
+# return = a byte array containing the file content
+# ----------------------------------------------
+sub get_file_content {
+    local('$handle $path $data');
+
+    $path = $1;
+
+    $handle = openf($path);
+    $data = readb($handle, -1);
+    closef($handle);
+    return $data;
+}
+
+# ----------------------------------------------
+# Retrieve the content of the user provided bof.
+#
+# @param path - the path to the file.
+# return = a byte array containing the bof content
+# ----------------------------------------------
+sub get_bof_content {
+    local('$path $unparsed_bof $parsed_bof');
+
+    $path = $1;
+    
+    $unparsed_bof = get_file_content($path);
+    if ($unparsed_bof is $null) {
+        berror($1, "Failed to retrieve BOF content");
+        return;
+    }
+
+    $parsed_bof = bof_extract($unparsed_bof, "go");
+
+    return $parsed_bof;
+}
+
+# ----------------------------------------------
+# Retrieve the packed arguments
+#
+# @param bid - the id of the current beacon
+# @param arch - bof architecture
+# @param output_pipe - the output pipe for new job
+# @param bof_data - contents of extract .o file (via bof_extract)
+# @param single_shot - boolean indicating whether the post-ex dll should act as a server or not
+# @param bof_alloc_type - The type of allocator that should be used for bof memory allocation
+# @param syscall_method - The syscall method to use for native api calls
+# @param thread_start - The thread start function that should be used when starting new threads
+# @param opts - the command line options data
+# return = a byte array containing the packed arguments
+# ----------------------------------------------
+sub get_packed_arguments {
+    local(
+        '$bid $arch $bof_data $output_pipe $packed_arguments $single_shot $bof_alloc_type ' .
+        '$syscall_method $thread_start %opts $i $arg_count $pack_result $arg_data'
+    );
+    
+    ($bid, $arch, $output_pipe, $bof_data, $single_shot, $bof_alloc_type, $syscall_method, $thread_start, %opts) = @_;
+
+    if(%opts["--fmt"] !is $null) {
+        # User-provided bof arguments
+        $arg_count = strlen(%opts["--fmt"]);
+        for ($i = 0; $i < $arg_count; $i++) {
+            # For each format specifier in the --fmt option, pack the value of --argX
+            $pack_result = bof_pack($bid, charAt(%opts["--fmt"], $i), %opts["--arg" . $i]);
+            $arg_data = $arg_data . $pack_result;
+        }
+    }
+    # We have to pack the total size of the arg data 
+    $arg_data = bof_pack($bid, "i", strlen($arg_data)) . $arg_data;
+    # Here we remove the 4 null bytes that are packed at the end by the bof_extract function
+    # where the user arguments are actually supposed to go
+    $bof_data = substr($bof_data, 0, strlen($bof_data) - 4);
+    # Append the user data to the end of the bof
+    $bof_data = $bof_data . $arg_data;
+
+    if(!$global_init) {
+        # The first bof that is executed by the server needs to contain a config that
+        # tells the postex dll whether to run as a server and process more bofs or just
+        # run this bof and exit. This structure of the raw data that is sent looks like:
+        # [ int runOnce, int allocType, int syscallMethod, char* threadStart ] [ char* output_pipe, byte[] bof_data ]
+        $packed_arguments = bof_pack($bid, "iiizzb", $single_shot, $bof_alloc_type, $syscall_method, $thread_start, $output_pipe, $bof_data);
+    } else {
+        # Once the async server is running, bofs only need to have their pipe handles packed
+        # [ char* output_pipe, byte[] bof_data ]
+        $packed_arguments = bof_pack($bid, "zb", $output_pipe, $bof_data);
+    }
+
+    return $packed_arguments;
+}
+
+# ----------------------------------------------
+# Retrieve the post-ex execute-async-bof dll
+#
+# @param bid - the id of the current beacon
+# @param arch - the architecture of the process we are injecting the post-ex dll into
+# @param postex_dll - a reference to store the post-ex dll data in 
+# return - on success, returns 1 and stores the dll contents in the 3rd argument to the function
+# ----------------------------------------------
+sub init_dll {
+    local('$bid $arch $postex_dll_path');
+
+    $bid = $1;
+    $arch = $2;
+
+    if($arch eq "x64") {
+        $postex_dll_path = getFileProper(script_resource("."), "async-execute.x64.dll");
+    } else if ($arch eq "x86") {
+        $postex_dll_path = getFileProper(script_resource("."), "async-execute.x86.dll");
+    } else{
+        berror($bid, "Invalid architecture");
+        return 0;
+    }
+
+    if (!-isFile $postex_dll_path) {
+        berror($bid, "Cannot find $postex_dll_path");
+        return 0;
+    }
+
+    $3 = get_file_content($postex_dll_path);
+    if ($3 is $null) {
+        berror($bid, "Failed to retrieve DLL content");
+        return 0;
+    }
+
+    return 1;
+}
+
+# ----------------------------------------------
+# Sets up a callback function for the post-ex job
+#
+# @param output_pipe - the pipe name to use 
+# @param bof_path - the bof path
+# @param single_shot - whether we are running in single_shot mode or not
+# return - a callback function that can be used with beacon_execute_postex_job
+# ----------------------------------------------
+sub setup_callback {
+    local('$output_pipe $bof_path $single_shot');
+
+    $output_pipe = $1;
+    $bof_path = $2;
+    $single_shot = $3;
+
+    return lambda({
+        local('$bid $data $result %info $type $output $desc $timeout $output_pipe');
+        this('$jid');
+
+        ($bid, $result, %info) = @_;
+
+        $type = %info["type"];
+
+        if ($type eq 'job_registered') {
+
+            $jid = %info['jid'];
+            if (!$single_shot) {
+                $global_jid = %info['jid'];
+                # Set global indicating that the post-ex
+                # async-execute process-resident server is up
+                $global_init = 1;
+                print_info("[*] Async-execute server running");
+            } else {
+                $global_running_single = 1;
+                print_info("[*] Async-execute single bof running");
+            }
+        }
+        # If the job is complete, null the job id
+        else if ($type eq 'job_completed') {
+            if(!$single_shot) {
+                print_info("[+] Async-execute server has terminated");
+                $global_jid = $null;
+                $global_init = 0;
+            } else {
+                print_info("[+] Asyn-execute single bof completed");
+                $global_running_single = 0;
+            }
+        }
+        else if ($type eq 'output') {
+            bjoblog($1, $jid, "Received output:\n" . $result);
+        } 
+        else if ($type eq 'error') {
+            bjoberror($1, $jid, "Received error:\n" . $result);
+        }
+    }, $output_pipe => $output_pipe, $bof_path => $bof_path, $single_shot => $single_shot);
+}
+
+# ----------------------------------------------
+# Retrieves the bof allocation method the post-ex dll should use for bofs
+# @param profile - The c2 profile
+# return - A numeric representation of the bof allocation type
+# ----------------------------------------------
+sub get_alloc_type {
+    local('$profile %bof_alloc_type $alloc_type');
+
+    $profile = $1;
+    $alloc_type = [$profile getString: ".process-inject.bof_allocator"];
+
+    %bof_alloc_type = %(MapViewOfFile => 0, HeapAlloc => 1, VirtualAlloc => 2);
+    if($alloc_type !in %bof_alloc_type) {
+        $alloc_type = %bof_alloc_type['VirtualAlloc'];
+    } else {
+        $alloc_type = %bof_alloc_type[$alloc_type];
+    }
+
+    return $alloc_type;
+}
+
+# ----------------------------------------------
+# Retrieve the thread hint from our c2 profile
+# @param profile - the c2 profile
+# return - A properly formatted thread start address such as ntdll.dll!RtlUserThreadStart+0x21 or $null on error
+# ----------------------------------------------
+sub get_thread_start {
+    local('$profile');
+
+    $profile = $1;
+    $thread_start = [$profile getString: ".post-ex.thread_hint"];
+    if(!$thread_start) {
+        # default to some sane value
+        $thread_start = "ntdll.dll!RtlUserThreadStart+0x21";
+    } else {
+        # Our neatly formatted string gets split up when retrieving it so we have to put it back together again
+        @parts = split(" ", $thread_start, 3);
+        if(size(@parts) == 2) {
+            $thread_start = @parts[0] . "!" . @parts[1];
+        } else if(size(@parts) == 3) {
+            $thread_start = @parts[0] . "!" . @parts[1] . "+0x" . formatNumber(@parts[2], 16);
+        } else {
+            return $null;
+        }
+    }
+
+    return $thread_start;
+}
+
+# ----------------------------------------------
+# Print information to the Script Console
+# $1 - message
+# ----------------------------------------------
+sub print_info {
+   println(formatDate("[HH:mm:ss] ") . "\cE[ASYNC-EXECUTE]\o " . $1);
+}
+
+# ----------------------------------------------
+# Process command line arguments
+# 
+# @param args - the command line arguments
+# @param opts_ref - a reference to the options hash to store the command line arguments
+# return - true on success, false on failure
+# ----------------------------------------------
+sub process_args {
+    local('@args %opts_ref $opt_cnt @valid_opts $opt_ind $opt $value %syscall_method %modes')
+
+    @args = $1;
+    %opts_ref = $2;
+
+    # Set the defaults
+    %opts_ref["--pid"] = "-1";
+    %opts_ref["--mode"] = "once";
+    %opts_ref["--syscall"] = "indirect";
+    %syscall_method = %(private_ntdll => 0, indirect => 1);
+    %modes = %(background => 0, once => 1);
+
+    # Assign parameters to the opts hash map
+    $opt_cnt = size(@args);
+    @valid_opts = @("--pid", "--arch", "--mode", "--bof", "--syscall", "--fmt");
+    for($opt_ind = 1; $opt_ind < $opt_cnt; $opt_ind++) {
+        $opt = @args[$opt_ind];
+        $opt_ind++;
+        $value = iff( $opt_ind >= $opt_cnt, $null, @args[$opt_ind] );
+
+        # Do some simple validation on opt and value
+        if ($opt !in @valid_opts) {
+            if ($opt ismatch "--arg[0-9]+") {
+                # Special case for bof arguments
+                %opts_ref[$opt] = $value;
+                continue;
+            }
+            berror(@args[0], "$opt is not a valid option.");
+            return 0;
+        }
+        if ($value is $null || $value in @valid_opts) {
+            berror(@args[0], "Missing or invalid value for the $opt option.");
+            return 0;
+        }
+
+        # Save the opt and value into the opts hash
+        %opts_ref[$opt] = $value;
+    }
+
+    # Validate required args
+    if ( %opts_ref["--arch"] is $null ) {
+        berror(@args[0], "Missing --arch argument.");
+        return 0;
+    } else if ( %opts_ref["--bof"] is $null ) {
+        berror(@args[0], "Missing --bof argument.");
+        return 0;
+    }
+
+    if ( %opts_ref["--syscall"] in %syscall_method ) {
+        %opts_ref["--syscall"] = %syscall_method[%opts_ref["--syscall"]];
+    } else {
+        berror(@args[0], "Invalid syscall method value.");
+        return 0;
+    }
+
+    if ( %opts_ref["--mode"] in %modes ) {
+        %opts_ref["--mode"] = %modes[%opts_ref["--mode"]];
+    } else {
+        berror(@args[0], "Invalid server type.");
+        return 0;
+    }
+
+    return 1;
+}
+
+# ----------------------------------------------
+# Run BOFs asynchronously
+# ----------------------------------------------
+alias async-execute {
+    local(
+        '$bid %opts $profile $alloc_type $output_pipe $thread_start $job_type ' .
+        '$cb_type $timeout $pid $arch $single_shot_mode $syscall_method $bof_path ' .
+        '$parsed_bof $packed_arguments $pipe_name'
+    );
+
+    $bid = @_[0];
+    %opts = %();
+    if(!process_args(@_, %opts)) {
+        return;
+    }
+
+    $profile = data_query("metadata")["c2profile"];
+    # Get our allocator to determine how bofs should be allocated by the post-ex dll
+    $alloc_type = get_alloc_type($profile);
+    # Two variations of the post-ex.pipename are used. The teamserver will patch in the 
+    # post-ex.pipename value as the named pipe for the post-ex dll. Here we get the pipe
+    # name again, but with a different value. This aggressor function relies on the pipe 
+    # name containing # values to replace. If it doesn't contain enough, it will throw an 
+    # error.
+    $pipe_name = get_postex_pipe();
+    if($pipe_name is $null) {
+        berror($bid, "Failed to get post-ex.pipename. Check script console output.");
+        return;
+    }
+    $output_pipe = "\\\\\.\\pipe\\" . $pipe_name;
+    # The post-ex.thread_hint string is used to provide a fake start address for all threads in the post-ex dll
+    $thread_start = get_thread_start($profile);
+    if(!$thread_start) {
+        berror($bid, "Invalid post-ex.thread_hint. Check c2 profile.");
+        return;
+    }
+    # Set our job type, callback type, and timeout
+    $job_type = "ANONYMOUS_BYTESTREAM";
+    $cb_type = "CALLBACK_POSTEX_KIT";
+    $timeout = 15000;
+    # Setup arguments
+    $pid = %opts["--pid"];
+    $arch = %opts["--arch"];
+    $single_shot_mode = %opts["--mode"];
+    $syscall_method = %opts["--syscall"];
+    $bof_path = %opts["--bof"];
+
+    # Handle some cases where we don't want to re-inject the post-ex dll
+    if ($single_shot_mode && $global_init) {
+        berror($bid, "Cannot run in single shot mode while an existing server is active. Manually terminate job $global_jid first.");
+        return;
+    } else if ($single_shot_mode && $global_running_single) {
+        berror($bid, "Cannot run in single shot mode while already running a single shot bof");
+        return;
+    } else if (!$single_shot_mode && $global_running_single) {
+        berror($bid, "Cannot run in server mode while already running a single shot bof");
+        return;
+    }
+
+    # Load the bof to execute
+    $parsed_bof = get_bof_content($bof_path);
+    if ($parsed_bof is $null) {
+        berror($bid, "Failed to extract target bof. Check script console output.");
+        return;
+    }
+    # Pack the arguments and prepend them to the bof data
+    $packed_arguments = get_packed_arguments(
+        $bid, 
+        $arch, 
+        $output_pipe, 
+        $parsed_bof, 
+        $single_shot_mode, 
+        $alloc_type, 
+        $syscall_method, 
+        $thread_start,
+        %opts
+    );
+
+    if ($single_shot_mode) {
+        if (!init_dll($bid, $arch, $postex_dll)) {
+            return;
+        }
+        if($pid eq "-1") {
+            $pid = $null;
+            btask($bid, "Using fork/run to execute postex job");
+        } else {
+            btask($bid, "Injecting postex job into $pid");
+        }
+        # Execute the single shot job
+        $callback = setup_callback($output_pipe, $bof_path, $single_shot_mode);
+        beacon_execute_postex_job($bid, $pid, $postex_dll, $packed_arguments, $callback);
+        # Ask beacon to start reading data from the bof pipe
+        bread_pipe($bid, $job_type, $cb_type, getFileName($bof_path), $output_pipe, 0, $timeout, $null);
+    } else {
+        if($global_init) {
+            # If we have already loaded our async post-ex dll then send
+            # the bof to it over the main named pipe
+            bjob_send_data($bid, $global_jid, $packed_arguments);
+            # Ask beacon to start reading data from the bof pipe
+            bread_pipe($bid, $job_type, $cb_type, getFileName($bof_path), $output_pipe, 0, $timeout, $null);
+            return;
+        } else {
+            # If this is our first run, inject the async bof postex dll
+            btask($bid, "Running in background mode. Arguments --pid and --syscall are ignored until background job has been terminated.");
+            if (!init_dll($bid, $arch, $postex_dll)) {
+                return;
+            }
+            if($pid eq "-1") {
+                $pid = $null;
+                btask($bid, "Using fork/run to execute postex job");
+            } else {
+                btask($bid, "Injecting postex job into $pid");
+            }
+            # Execute the async job
+            $callback = setup_callback($output_pipe, $bof_path, $single_shot_mode);
+            beacon_execute_postex_job($bid, $pid, $postex_dll, $packed_arguments, $callback);
+            # Ask beacon to start reading data from the bof pipe
+            bread_pipe($bid, $job_type, $cb_type, getFileName($bof_path), $output_pipe, 0, $timeout, $null);
+        }
+    }
+}
+
+# --------------------
+# Register the async-execute command
+# --------------------
+beacon_command_register(
+"async-execute", 
+"Execute bofs asynchronously",
+"Usage: async-execute --pid <pid> --arch <arch> --mode <mode> --bof <bof_path> --syscall <syscall_method> --fmt <bof_arguments_fmt> --argX <bof_argument>\n\n" .
+"Optional arguments: \n" .
+"--pid - Process id. Defaults to -1 for fork/run if not provided. When used with --mode background only needs to be specified for first bof. It will be ignored until the \n" .
+"background job is manually terminated, at which point you can specify it again for a new single bof or background job.\n" .
+"--mode - BOF execution mode. Specify background or once. Defaults to once. Once mode executes one bof and exits. Background mode executes the provided bof and then continually \n" .
+"processes additional bofs in an asyncronous manner until its job is manually terminated.\n" .
+"--syscall - Syscall method. Can be either private_ntdll or indirect. Defaults to indirect. Indirect uses indirect syscalls, private_ntdll maps its own copy of ntdll. When used \n" .
+"with --mode background, only needs to be specified for first bof. All consecutive bofs will use the same value.\n" .
+"--fmt - A format string to be used with bof_pack to pack your bof user arguments. For each format specifier, provide an --argX for the corresponding argument. For example, if \n" .
+"you are passing two unicode strings, use --fmt ZZ. You should then provide two args like so: --arg0 first_string --arg1 second_string. The order is important.\n" .
+"--argX - A numbered argument that will be used with the --fmt option to pack your bof user arguments. These should be provided in the order of your format specifier. See --fmt \n" .
+"or examples for usage.\n" .
+"Required arguments: \n" .
+"--arch - System architecture. Can be either x86 or x64.\n" .
+"--bof - Full path of bof to run.\n\n" .
+"Examples:\n" .
+"Fork/Run single bof: async-execute --arch x64 --bof /path/to/bof.x64.o\n" . 
+"Inject and wait for more bofs: async-execute --pid 1234 --arch x86 --mode background --bof /path/to/bof.x86.o --syscall private_ntdll\n" .
+"Run another bof asynchronously while the previous bof is still executing: async-execute --arch x86 --mode background --bof /path/to/newbof.x86.o\n" .
+"Pass arguments to your bof: async-execute --arch x64 --bof /path/to/bof.x64.o --fmt iZi --arg0 15000 --arg1 \"Some debug string with spaces\" --arg2 1024",
+"postexdll"
+);
+print_info("[+] Async-execute post-ex DLL loaded");

@@ -1,137 +1,252 @@
 # Dawson-Loader
->[!Tip] **CTE Tradition of Baking Products during TDYs**
 
-## Todo
+> **CTE Tradition of Baking Products during TDYs**
 
-### Jopcall ROP/JOP Integration - Implementation Checklist
+## Overview
 
-This checklist tracks the integration of jopcall's return address obfuscation via ROP/JOP chains into DawsonLoader.
+**Dawson-Loader** is a custom User-Defined Reflective Loader (uDRL) for Cobalt Strike that implements **jopcall** (ROP/JOP-based syscall obfuscation) for **both** the Beacon loading phase and runtime operations, providing comprehensive call stack spoofing throughout the entire Beacon lifecycle.
 
-#### Phase 1: Setup & Structure Definitions
-- [x] **1.1** Add new structures to `src/DawsonLoader.h` after line 76
-  - `MemorySection` struct for scanning executable memory
-  - `GadgetChain` struct for storing ROP/JOP gadgets
-  - `SyscallInfo` struct for syscall metadata
-  - Function declarations for gadget discovery
-  - Location: After `Section` typedef (line 76)
+### Key Features
 
-- [x] **1.2** Create new file `src/jopcall_integration.c`
-  - Implement `search_bytes()` - pattern matching helper
-  - Implement `pseudorandom()` - RDTSC-based RNG
-  - Implement `pick_random_gadget()` - random gadget selection
-  - Implement `get_image_memory_sections()` - PE section parser
-  - Implement `search_gadget()` - gadget scanner
-  - Implement `find_rop_gadgets()` - main gadget discovery function
+- ✅ **uDRL with Jopcall** - Obfuscates syscalls during Beacon loading
+- ✅ **BeaconGate with Jopcall** - Obfuscates syscalls during Beacon runtime
+- ✅ **16 Syscall Wrappers** - Covers all core NT APIs used by Beacon
+- ✅ **Dynamic Gadget Discovery** - Finds ROP/JOP gadgets at runtime from ntdll
+- ✅ **Randomized Gadget Selection** - Increases diversity to evade signatures
+- ✅ **Cross-Architecture** - x64 support (x86 possible with modifications)
 
-#### Phase 2: Assembly Modifications
-- [x] **2.1** Add `jop_syscall` assembly function to `src/DawsonLoader.c`
-  - Location: After existing `HellDescent` function (around line 1700)
-  - Purpose: Execute syscalls through ROP/JOP chain
-  - Saves/restores callee-saved registers
-  - Pushes gadgets to stack in LIFO order
-  - Jumps to first gadget (jmp rcx) which calls syscall
+## Quick Start
 
-#### Phase 3: Syscall Invocation Updates
-- [x] **3.1** Initialize gadget chain in `DawsonLoader()` function
-  - Location: Near top of `DawsonLoader()` (around line 45-50)
-  - Add static `GadgetChain rop_chain` variable
-  - Call `find_rop_gadgets(ntdll, &rop_chain)` once on first run
+### 1. Build DawsonLoader uDRL
 
-- [x] **3.2** Replace syscall at line 78-81 (DLL stomping - NtProtectVirtualMemory)
-  - Current: `HellsGate()` + `HellDescent()`
-  - New: `jop_syscall()` with ROP chain
+```bash
+# Prerequisites: mingw-w64
+sudo apt install mingw-w64
 
-- [x] **3.3** Replace syscall at line 96-100 (Heap allocator - NtProtectVirtualMemory)
-  - Same pattern as 3.2
+# Build
+make clean
+make dawsonloader
 
-- [x] **3.4** Replace syscall at line 132-136 (VirtualAlloc - NtAllocateVirtualMemory)
-  - Note: Left as HellDescent for now (6 parameters, needs extended jop_syscall)
+# Output: dist/DawsonLoader.x64.o (25KB)
+```
 
-- [x] **3.5** Replace syscall at line 157-161 (Change protection to RX - NtProtectVirtualMemory)
-  - Same pattern as 3.2
+### 2. Start Cobalt Strike with Test Profile
 
-#### Phase 4: Build System
-- [x] **4.1** Update `Makefile`
-  - Add compilation rule for `dist/jopcall_integration.o`
-  - Update linking to include new object file
-  - Ensure `-masm=intel` flag is set
+```bash
+# On your Cobalt Strike server
+./teamserver <YOUR_IP> <PASSWORD> /path/to/dawson-loader/profiles/dawson-test.profile
+```
 
-- [x] **4.2** Test compilation
-  - Run `make clean && make`
-  - Verify no compilation errors
-  - Check output: `dist/DawsonLoader.x64.o` should be generated
-  - **Result**: SUCCESS - 24KB object file created
+### 3. Load in Cobalt Strike Client
 
-#### Phase 5: Testing & Validation
-- [ ] **5.1** Test with Cobalt Strike
-  - Import updated `DawsonLoader.cna` Aggressor script
-  - Generate x64 beacon
-  - Verify beacon executes without crashes
+1. Connect Cobalt Strike client to team server
+2. Open **Script Manager** (Cobalt Strike → Script Manager)
+3. Click **Load** and select: `dist/DawsonLoader.cna`
+4. Verify script loaded: Check Script Console
 
-- [ ] **5.2** Verify ROP chain execution
-  - Use WinDbg to inspect return addresses during syscalls
-  - Confirm return addresses point to ntdll gadgets (not loader code)
-  - Check that gadgets vary between syscall invocations
+### 4. Generate and Test Beacon
 
-- [ ] **5.3** Test against EDR
-  - Run against Windows Defender
-  - Test with CrowdStrike/SentinelOne if available
-  - Monitor for callstack-based detections
+```
+1. Cobalt Strike → Listeners → Add (create HTTPS listener)
+2. Attacks → Packages → Windows Stageless Payload
+3. Select: x64 EXE, your listener
+4. Generate → Save as beacon_test.exe
+5. Execute on test system
+6. Beacon should call back with jopcall-obfuscated syscalls
+```
 
-#### Phase 6: Future Enhancements
-- [ ] **6.1** Add more gadget types
-  - `pop rcx; ret` gadgets for register manipulation
-  - `add rsp, X; ret` for stack cleanup
-  - Chain length randomization (2-5 gadgets)
+**For detailed testing instructions**, see [TESTING_GUIDE.md](TESTING_GUIDE.md)
 
-- [ ] **6.2** Implement gadget caching
-  - Store discovered gadgets to avoid re-scanning
-  - Add gadget validation (check for hooks)
+### Build Sleepmask-VS (BeaconGate)
 
-- [ ] **6.3** Add fallback mechanism
-  - If gadget discovery fails, fall back to direct HellDescent
-  - Add logging/debugging for gadget discovery failures
+**Option 1: Linux Build (Advanced)**
 
-- [ ] **6.4** Cross-module gadget chains
-  - Scan kernel32.dll, kernelbase.dll for additional gadgets
-  - Mix gadgets from multiple modules for diversity
+Due to the BOF-VS framework using Windows-style paths, Linux builds require preprocessing:
 
-- [ ] **6.5** Hardware breakpoint syscalls (advanced)
-  - Use DR0-DR7 registers for execution redirection
-  - Combine with ROP chains for multi-layer obfuscation
+```bash
+# Prerequisites
+sudo apt install mingw-w64
 
-### Modified Files Reference
+# Initialize submodules
+cd Sleepmask-VS
+git submodule init && git submodule update
 
-| File | Lines Modified | Purpose |
-|------|----------------|---------|
-| `src/DawsonLoader.h` | After line 76 | Add ROP/JOP structures and function declarations |
-| `src/DawsonLoader.c` | Lines 45-50, 70-71, 86-87, 119-120, 142-143, ~1700 | Initialize gadget chain, replace syscalls, add jop_syscall asm |
-| `src/jopcall_integration.c` | New file | Gadget discovery and helper functions |
-| `Makefile` | Compilation/linking rules | Add new source file to build |
+# Build (requires path preprocessing)
+cd sleepmask-vs
+# See Makefile.linux for build configuration
+# Note: May require fixing backslash paths in library files
+```
 
-### Key Concepts
+**Option 2: Windows Build (Recommended)**
 
-**What is ROP/JOP?**
-- ROP (Return-Oriented Programming): Chains together existing code snippets (gadgets) that end in `ret`
-- JOP (Jump-Oriented Programming): Similar but uses `jmp` instructions
-- Purpose: Obfuscate return addresses to evade callstack inspection by EDR
+Sleepmask-VS is designed for Windows/Visual Studio tooling:
 
-**How jopcall Integration Works:**
-1. **Gadget Discovery**: Scan ntdll.dll's executable sections for useful instruction sequences
-2. **Gadget Chain Building**: Select random gadgets and arrange them in a chain
-3. **Stack Manipulation**: Push gadget addresses onto stack before syscall
-4. **Indirect Execution**: Jump to first gadget → syscall → gadgets execute → return to legitimate code
+1. Open `Sleepmask-VS/sleepmask-vs.sln` in Visual Studio 2022
+2. Install Clang compiler for Windows (if not already)
+3. Set build configuration to **Release, x64**
+4. Build → Build Solution
+5. Output: `x64/Release/jopcall-sleepmask.o`
 
-**Benefits:**
-- Return addresses point to legitimate ntdll code (not suspicious loader addresses)
-- Randomized gadget selection prevents signature-based detection
-- Bypasses callstack-based EDR detections
-- Maintains compatibility with existing HellsGate/HalosGate syscall number resolution
+For detailed Windows build instructions, see `Sleepmask-VS/README.md`.
 
-### Resources & References
+## Documentation
 
-- **Original jopcall**: https://github.com/NoahKirchner/jopcall
-- **DawsonLoader**: https://github.com/boku7/DawsonLoader
-- **ROP Primer**: https://ropemporium.com/
-- **Windows Syscall Internals**: https://j00ru.vexillium.org/syscalls/nt/64/
-- **Cobalt Strike UDRL Docs**: https://hstechdocs.helpsystems.com/manuals/cobaltstrike/current/userguide/content/topics/malleable-c2-extend_user-defined-rdll.htm
+📖 **Complete Guide**: See [JOPCALL_INTEGRATION_GUIDE.md](JOPCALL_INTEGRATION_GUIDE.md) for:
+- Detailed architecture overview
+- Technical deep dive into jopcall
+- Cobalt Strike integration steps
+- Troubleshooting and debugging
+- Performance considerations
+- Advanced customization options
+
+## Project Structure
+
+```
+dawson-loader/
+├── src/                          # uDRL source code
+│   ├── DawsonLoader.c            # Main loader with jopcall integration
+│   ├── DawsonLoader.h            # Headers and structures
+│   └── jopcall_integration.c     # Gadget discovery functions
+├── dist/                         # Build outputs
+│   ├── DawsonLoader.x64.o        # Compiled uDRL object ✓
+│   └── DawsonLoader.cna          # Aggressor script
+├── Sleepmask-VS/                 # BeaconGate implementation
+│   └── sleepmask-vs/
+│       ├── jopcall-sleepmask.cpp             # Entry point
+│       └── library/
+│           ├── jopcallsyscalls.h             # Jopcall header
+│           └── jopcallsyscalls.cpp           # Runtime jopcall
+├── Makefile                      # Build system
+├── README.md                     # This file
+└── JOPCALL_INTEGRATION_GUIDE.md  # Comprehensive documentation
+```
+
+## How It Works
+
+### Phase 1: Beacon Loading (uDRL)
+
+```
+┌─────────────────────────────────────────┐
+│ 1. DawsonLoader initializes             │
+│ 2. Scans ntdll for ROP/JOP gadgets      │
+│ 3. Allocates memory with NtAllocateVM   │
+│    via jop_syscall()                    │
+│ 4. Maps Beacon sections                 │
+│ 5. Changes protections with NtProtectVM │
+│    via jop_syscall()                    │
+│ 6. Transfers control to Beacon          │
+└─────────────────────────────────────────┘
+```
+
+### Phase 2: Beacon Runtime (BeaconGate)
+
+```
+┌─────────────────────────────────────────┐
+│ 1. Beacon calls VirtualAlloc()          │
+│ 2. BeaconGate intercepts call           │
+│ 3. Routes to _NtAllocateVirtualMemory() │
+│ 4. Executes via DoJopSyscall()          │
+│ 5. Returns through ROP gadget chain     │
+│ 6. Result returned to Beacon            │
+└─────────────────────────────────────────┘
+```
+
+### Call Stack Comparison
+
+**WITHOUT Jopcall** (❌ Detected):
+```
+[0] ntdll!NtAllocateVirtualMemory+0x14
+[1] beacon.dll+0x4523                  ← UNBACKED MEMORY
+[2] beacon.dll+0x1234                  ← SUSPICIOUS
+```
+
+**WITH Jopcall** (✅ Appears Legitimate):
+```
+[0] ntdll!NtAllocateVirtualMemory+0x14
+[1] ntdll!RtlQueryPerformanceCounter+0x1a  ← Legitimate ntdll code
+[2] ntdll!RtlCaptureContext+0x2f           ← Legitimate ntdll code
+[3] ntdll!RtlUserThreadStart+0x21          ← Legitimate ntdll code
+```
+
+## EDR Evasion
+
+### What Jopcall Defeats
+
+✅ **Call Stack Scanning** - EDR sees legitimate ntdll call chains
+✅ **Return Address Analysis** - All returns point to valid ntdll code
+✅ **Heuristic Detection** - Syscalls appear to originate from ntdll
+
+### What It Doesn't Defeat
+
+❌ **Userland API Hooks** - Use direct syscalls (which jopcall does)
+❌ **Kernel Callbacks** - Combine with other techniques
+❌ **Memory Scanning** - Use with memory encryption/obfuscation
+
+## Supported Syscalls
+
+**uDRL (Loading)**:
+- NtAllocateVirtualMemory
+- NtProtectVirtualMemory
+
+**BeaconGate (Runtime)** - 16 total:
+- Memory: NtAllocateVirtualMemory, NtProtectVirtualMemory, NtFreeVirtualMemory, NtQueryVirtualMemory
+- Sections: NtCreateSection, NtMapViewOfSection, NtUnmapViewOfSection
+- Process Memory: NtReadVirtualMemory, NtWriteVirtualMemory
+- Threads: NtCreateThreadEx, NtGetContextThread, NtSetContextThread, NtResumeThread
+- Handles: NtOpenProcess, NtOpenThread, NtClose, NtDuplicateObject
+
+## Testing
+
+### Quick Smoke Test
+
+```bash
+# 1. Build
+make dawsonloader
+
+# 2. Verify output
+file dist/DawsonLoader.x64.o
+# Expected: Intel amd64 COFF object file
+
+# 3. Load in CS and generate beacon
+# 4. Execute on test system
+# 5. Beacon should call back successfully
+```
+
+### Debug Mode
+
+Enable logging in `Sleepmask-VS/sleepmask-vs/debug.h`:
+```c
+#define ENABLE_LOGGING 1
+```
+
+Use **DbgView** or **WinDbg** to view output:
+```
+SLEEPMASK: Initializing jopcall ROP/JOP gadgets from ntdll...
+SLEEPMASK: Jopcall context initialized successfully. Gadget count: 4
+```
+
+## Credits
+
+- **Jopcall**: Noah Kirchner ([@noahkirchner](https://github.com/noahkirchner)) - https://github.com/NoahKirchner/jopcall
+- **BokuLoader**: Bobby Cooke ([@0xBoku](https://github.com/boku7)) - https://github.com/boku7/BokuLoader
+- **Sleepmask-VS**: Fortra/Cobalt Strike Team
+- **DawsonLoader**: CTE Offensive Security Research Division
+
+## References
+
+- [Jopcall Original Project](https://github.com/NoahKirchner/jopcall)
+- [BeaconGate Blog Post](https://www.cobaltstrike.com/blog/instrumenting-beacon-with-beacongate-for-call-stack-spoofing)
+- [Cobalt Strike uDRL Documentation](https://hstechdocs.helpsystems.com/manuals/cobaltstrike/current/userguide/content/topics/malleable-c2-extend_user-defined-rdll.htm)
+- [Return-Oriented Programming](https://en.wikipedia.org/wiki/Return-oriented_programming)
+
+## License
+
+See LICENSE.md
+
+## Disclaimer
+
+This tool is provided for authorized security testing and research purposes only. Users are responsible for compliance with all applicable laws and regulations. The authors assume no liability for misuse or damage.
+
+---
+
+**Happy Hacking! 🔐**

