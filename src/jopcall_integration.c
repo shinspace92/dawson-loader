@@ -44,7 +44,7 @@ DWORD pseudorandom() {
         "rol eax, cl        \n"
         : "=a" (rng)
         :
-        : "ecx", "edx", "r8", "r9"
+        : "ebx", "ecx", "edx", "r8", "r9"  // Added "ebx" - CPUID modifies it!
     );
     return rng;
 }
